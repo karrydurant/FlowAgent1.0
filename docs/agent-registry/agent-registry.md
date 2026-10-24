@@ -103,7 +103,22 @@ public class AgentRegistryService {
     }
 
     // 同一个 agentId 的 a2aEndpoint 被改成了另一个地址时告警一次
-    
+    private void warnIfEndpointMoved(AgentCard previous, AgentCard current) {
+        String before = previous.getA2aEndpoint();
+        String now = current.getA2aEndpoint();
+        if (before == null || now == null || before.equals(now)) {
+            return;
+        }
+
+        // 按 (agentId, 新地址) 去重
+        if (!warnedEndpointMoves.add(current.getAgentId() + '|' + now)) {
+            return;
+        }
+        log.warn("[Registry] agentId {} 的 a2aEndpoint 被改写了：{} → {}。"
+                        + "注册表没有实例维度，两个副本发布同名 Agent 时地址会互相覆盖，"
+                        + "已开会话的投递会跟着换进程。",
+                current.getAgentId(), before, now);
+    }
 }
 ```
 
