@@ -15,12 +15,91 @@
 </p>
 
 
-这是一个用 Java 和 Spring AI 写的多 Agent 工作流编排平台，把多个 Agent "怎么串成流程，怎么协商、互相委派" 做成了一套基础设施。
+这是一个用 Java 和 Spring AI 写的多 Agent 工作流编排平台，把多个 Agent "怎么串成流程，怎么'协商'、互相委派" 做成了一套基础设施。
 
-协商部分：
+协商：这里的协商是 "召集者把同一个议题分发给每个成员，各成员生成结构化表态后再按模式算结论"，不是"多个 Agent 间互相聊天、辩论" 
 
-互相委派：本项目通过将 一个Agent注册为工具的方式使得其它 Agent 能委派该 Agent
+互相委派：通过将一个 Agent 注册为工具的方式使得其它 Agent 能委派该 Agent
 
 ## 使用指南
 
+前置依赖检查
 
+```bash
+java -version
+mvn -v
+docker compose version
+node -v
+```
+
+终端一
+
+```bash
+# 1. 拉取代码
+git clone <仓库地址> flowagent
+cd flowagent
+
+# 2. 设置环境变量（替换成你自己的令牌和配置）
+export OPENAI_API_KEY=ms-你的魔搭令牌
+export ROCKETMQ_NAME_SERVER=127.0.0.1:9876
+export ROCKETMQ_PRODUCER_GROUP=flowagent-producer
+
+# 3. 启动所有依赖中间件：redis neo4j postgres mysql rocketmq
+docker compose up -d --wait redis neo4j postgres mysql rocketmq-namesrv rocketmq-broker
+
+# 4. 循环等待 RocketMQ broker 启动成功（最多等待60秒）
+for i in $(seq 1 30); do
+  docker logs flowagent-rocketmq-broker 2>&1 | grep -q 'boot success' && break
+  sleep 2
+done
+
+# 校验 namesrv、broker 是否启动成功
+docker logs flowagent-rocketmq-namesrv --tail 5 | grep 'boot success'
+docker logs flowagent-rocketmq-broker --tail 5 | grep 'boot success'
+
+# 5. 导入 MySQL 业务表结构
+docker exec -i flowagent-mysql mysql -uroot -pchangeme < flowagent-server/src/main/resources/db/business-schema.sql
+# 检查表是否导入成功
+docker exec flowagent-mysql mysql -uroot -pchangeme -e "show tables from flowagent_business;"
+
+# 6. 前端打包编译
+cd flowagent-web
+npm ci
+npm run deploy
+cd ..
+
+# 7. maven 打包（跳过测试），然后启动后端服务，日志输出到 flowagent.log
+mvn -DskipTests clean install
+mvn spring-boot:run -pl flowagent-server 2>&1 | tee flowagent.log
+```
+
+终端2
+
+```bash
+cd flowagent
+
+# 轮询等待后端健康端口就绪
+until curl -sf http://localhost:8081/actuator/health >/dev/null; do sleep 2; done
+
+# 打印健康状态
+curl -s http://localhost:8081/actuator/health; echo
+
+# 查看日志里是否输出 [Messaging] 审批唤醒（确认消息组件正常）
+grep -m1 '\[Messaging\] 审批唤醒' flowagent.log
+
+# 调用 MCP tools/list 接口测试
+curl -s -X POST http://localhost:8081/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'; echo
+```
+
+```plaintext
+# 主页面
+http://localhost:8081
+# Swagger 接口文档
+http://localhost:8081/swagger-ui.html
+```
+
+## [多 Agent 工作流的执行引擎](docs/workflow-engine/workflow-engine.md)
+
+## []
