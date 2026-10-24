@@ -125,3 +125,148 @@ public class AgentRegistryService {
 ## 如何发现对应的 Agent
 
 按能力标签（精确匹配+通配）
+
+# AgentCard
+
+Agent 的数字名片。
+
+核心字段：
+
+签名——JWS 确保不可伪造
+
+能力描述——自然语言 + 结构化标签，供 LLM 路由决策
+
+端点——A2A 接口 URL + 健康检查 URL
+
+安全策略——支持的认证方式、所需权限
+
+```java
+package com.flowagent.common.model;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * A2A Agent Card — Agent 的"数字名片"。
+ * <p>
+ * 符合 Google A2A 协议 v1.0 规范。
+ * 每个 Agent 在注册时签发一张 Agent Card，包含身份、能力、
+ * 端点、安全策略等元数据。其他 Agent 通过 Agent Card 发现
+ * 和验证对方身份。
+ * </p>
+ *
+ * <p>
+ * <b>模块归属说明</b>：本类同时被 A2A 网关（签发/使用）与
+ * Agent 注册中心（存储/查询）引用。为避免两者形成循环依赖，
+ * 将其下沉到 {@code flowagent-common} 作为共享领域模型。
+ * </p>
+ *
+ * <h3>Agent Card 的核心字段</h3>
+ * <ul>
+ *   <li><b>签名</b> — JWS (JSON Web Signature) 确保不可伪造</li>
+ *   <li><b>能力描述</b> — 自然语言 + 结构化标签，供 LLM 路由决策</li>
+ *   <li><b>端点</b> — A2A 接口 URL + 健康检查 URL</li>
+ *   <li><b>安全策略</b> — 支持的认证方式、所需权限</li>
+ * </ul>
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class AgentCard {
+
+    // ======================== 基础信息 ========================
+
+    /** Agent 唯一标识（全局唯一） */
+    private String agentId;
+
+    /** Agent 显示名称 */
+    private String name;
+
+    /** Agent 版本 */
+    @Builder.Default
+    private String version = "1.0.0";
+
+    /** Agent 描述（自然语言，供 LLM 路由判断） */
+    private String description;
+
+    /** 所属组织 */
+    private String organization;
+
+    // ======================== 能力描述 ========================
+
+    /** 能力标签（结构化，用于精确匹配） */
+    private List<String> capabilities;
+
+    /** 专长领域（自然语言描述；当前不参与检索，语义匹配是 Roadmap 项） */
+    private String expertise;
+
+    /** 适用场景 */
+    private List<String> applicableScenarios;
+
+    /** 限制条件（什么情况下不应该调用此 Agent） */
+    private String limitations;
+
+    // ======================== 端点 ========================
+
+    /** A2A 协议端点 URL */
+    private String a2aEndpoint;
+
+    /** 健康检查端点 */
+    private String healthCheckEndpoint;
+
+    /** MCP 端点（此 Agent 暴露的工具） */
+    private String mcpEndpoint;
+
+    // ======================== 安全 ========================
+
+    /** Agent Card 签名（JWS） */
+    private String signature;
+
+    /** 签名公钥（JWK 格式） */
+    private Map<String, Object> publicKey;
+
+    /** 支持的认证方式 */
+    @Builder.Default
+    private List<String> authMethods = List.of("bearer_token", "api_key");
+
+    /** 所需的最小权限级别 */
+    @Builder.Default
+    private String requiredPermissionLevel = "read";
+
+    // ======================== 运行时配置 ========================
+
+    /** 默认 LLM 模型 */
+    private String defaultModel;
+
+    /** 支持的工具 ID 列表 */
+    private List<String> supportedToolIds;
+
+    /** 预期的最大响应时间（秒） */
+    private int expectedMaxResponseTimeSeconds;
+
+    /** 是否接受委派任务 */
+    @Builder.Default
+    private boolean acceptsDelegation = true;
+
+    /** 并发任务上限 */
+    @Builder.Default
+    private int maxConcurrentTasks = 5;
+
+    // ======================== 元数据 ========================
+
+    /** 自定义标签 */
+    private Map<String, String> labels;
+
+    /** 注册时间 */
+    private Long registeredAt;
+
+    /** 最后心跳时间 */
+    private Long lastHeartbeatAt;
+}
+```
