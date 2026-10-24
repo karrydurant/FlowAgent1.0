@@ -119,6 +119,77 @@ public class AgentRegistryService {
                         + "已开会话的投递会跟着换进程。",
                 current.getAgentId(), before, now);
     }
+
+    // 按多条件查询 Agent
+    public List<AgentCard> query(List<String> capabilities, String scenario) {
+        return agentCache.values().stream()
+                .filter(card -> card.getLastHeartbeatAt() != null)
+                .filter(this::isAlive)
+                .filter(card -> capabilities == null || capabilities.isEmpty()
+                        || hasAllCapabilities(card, capabilities))
+                .filter(card -> scenario == null || scenario.isBlank()
+                        || matchesScenario(card, scenario))
+                .toList();
+    }
+    // 更新心跳时间
+    public boolean heartbeat(String agentId) {
+        // 先查内存，再回落到 Redis
+        // 本进程重启后内存缓存是空的，但 Agent 的 Card 可能还在 Redis 里，此时心跳不应该被静默丢弃
+        AgentCard card = agentCache.get(agentId);
+        if (card == null) {
+            card = getAgent(agentId).orElse(null);
+        }
+        if (card == null) {
+            log.debug("[Registry] heartbeat for unknown agent | id={}", agentId);
+            return false;
+        }
+
+        card.setLastHeartbeatAt(System.currentTimeMillis());
+        agentCache.put(agentId, card);
+        // 重写 Redis 同时顺带续期 TTL —— 心跳停了 key 就自然过期，无需额外清理
+        persist(card);
+        return true;
+    }
+
+    // 检查 Agent 是否存活
+    public boolean isAlive(String agentId) {
+        return getAgent(agentId)
+                .map(this::isAlive)
+                .orElse(false);
+    }
+
+    private boolean isAlive(AgentCard card) {
+        if (card.getLastHeartbeatAt() == null) return false;
+        long elapsed = System.currentTimeMillis() - card.getLastHeartbeatAt();
+        return elapsed < heartbeatTimeoutMillis();
+    }
+
+    // 清理过期 Agent
+    public List<String> cleanupExpired() {
+        List<String> expired = agentCache.values().stream()
+                .filter(card -> !isAlive(card))
+                .map(AgentCard::getAgentId)
+                .toList();
+
+        for (String agentId : expired) {
+            log.info("[Registry] removing expired agent | id={} | 心跳超时 {}s",
+                    agentId, heartbeatTimeoutSeconds);
+            unregister(agentId);
+        }
+        return expired;
+    }
+
+    // 已注册的 Agent 数量
+    public int size() {
+        return agentCache.size();
+    }
+
+    // 场景模糊匹配
+    private boolean matchesScenario(AgentCard card, String scenario) {
+        if (card.getApplicableScenarios() == null) return false;
+        return card.getApplicableScenarios().stream()
+                .anyMatch(s -> s.toLowerCase().contains(scenario.toLowerCase()));
+    }
 }
 ```
 
