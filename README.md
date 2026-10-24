@@ -102,4 +102,14 @@ http://localhost:8081/swagger-ui.html
 
 ## [多 Agent 工作流的执行引擎](docs/workflow-engine/workflow-engine.md)
 
-## []
+## [多 Agent 协商引擎](docs/a2a-engine/a2a-engine.md)
+
+## [A2A 会话与消息传输](docs/a2a-conversation/a2a-conversation.md)
+
+## [ReAct 循环](docs/ReAct/ReAct.md)
+
+## [MCP 工具网关](docs/mcp-gateway/mcp-gateway.md)
+
+## [人工审批与挂起恢复](docs/human-approve/human-approve.md)
+
+## [Agent 注册与能力发现](docs/agent-registry/agent-registry.md)
