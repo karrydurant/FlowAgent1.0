@@ -47,6 +47,12 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.Lock;
+
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -100,6 +106,63 @@ public class WorkflowExecutor {
             r -> new Thread(r, "flowagent-workflow-" + UUID.randomUUID().toString().substring(0, 4)),
             new ThreadPoolExecutor.CallerRunsPolicy()
     );
+
+    // 保留的已结束运行实例上限（LRU 淘汰）
+    private static final int FINISHED_RUN_RETENTION = 200;
+
+    // 运行中的工作流（runId → WorkflowRun）
+    private final ConcurrentHashMap<String, WorkflowRun> runningWorkflows = new ConcurrentHashMap<>();
+
+    // 已结束的工作流，LRU 有界保留
+    private final Map<String, WorkflowRun> finishedWorkflows = Collections.synchronizedMap(
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, WorkflowRun> eldest) {
+                    return size() > FINISHED_RUN_RETENTION;
+                }
+            }
+    );
+
+    // 提交并同步执行一个工作流（阻塞直到执行完成）
+    public WorkflowRun execute(WorkflowDefinition definition, Map<String, Object> input) {
+        WorkflowRun run = createRun(definition, input);
+        executeInternal(definition, run);
+        return run;
+    }
+
+    // 提交并异步执行一个工作流（立即返回 runId，后台执行）
+    // DAG 校验在提交时同步完成，定义非法会立即抛异常，而不会静默进入后台失败。
+    public WorkflowRun submit(WorkflowDefinition definition, Map<String, Object> input) {
+        WorkflowRun run = createRun(definition, input);
+        workflowExecutor.execute(FlowAgentContext.wrap(() -> executeInternal(definition, run)));
+        return run;
+    }
+
+    /**
+     * 从 Checkpoint 恢复一次中断的工作流
+     * 三道校验
+     * 快照存在：Redis 中有该 runId 的 checkpoint，否则 404
+     * 定义未变：WorkflowDefinition fingerprint() 与快照记录的一致。
+     * 状态可恢复：只拒绝 COMPLETED（无事可做）与 CANCELLED（显式终止）这两种
+     *
+     * 不保证节点副作用的事务性
+     * 要求节点执行器自身幂等；对不幂等的外部调用（下单、扣款、发通知），应由节点实现携带幂等键，引擎层无法代劳
+     */
+    public WorkflowRun resume(WorkflowDefinition definition, String runId) {
+        WorkflowRun run = prepareResume(definition, runId);
+        executeInternal(definition, run);
+        return run;
+    }
+
+    // 异步版断点续跑：立即返回，后台继续执行
+    public WorkflowRun resumeAsync(WorkflowDefinition definition, String runId) {
+        WorkflowRun run = prepareResume(definition, runId);
+        workflowExecutor.execute(FlowAgentContext.wrap(() -> executeInternal(definition, run)));
+        return run;
+    }
+
+    // 审批有结果了——把挂起的运行唤醒，按结论继续或走降级
+    // 本方法是幂等的，重复调用是安全的。启动前的第一道门会核对「这个 run 是否正停在 nodeId 上等审批
 }
 ```
 
