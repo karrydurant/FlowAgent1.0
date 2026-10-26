@@ -14,13 +14,339 @@
 
 ## 状态字段——NegotiationState
 
+```java
+
+```
+
 ## 业务流程——NegotiationCoordinator
 
-### 轮次状态机——NegotiationRoundRunner
+### 轮次状态机
+
+#### 开下一轮——beginRound
+
+```java
+private NegotiationState beginRound(NegotiationState state, StepPlan plan) {
+    // 算本轮的时间边界
+    long now = now();
+    int nextRound = state.getRound() + 1;
+    long limit = roundLimit(state, now);
+    long roundDeadline = deadlines.roundDeadline(limit, now, properties.getPerRoundTimeoutMs());
+    if (roundDeadline <= now) {
+        return finishWithoutRound(state, plan, now);
+    }
+
+    // 重置本轮的所有状态字段
+    state.setRound(nextRound);
+    state.setStatus(Status.RUNNING);
+    state.setPhase("ROUND_POST");
+    state.setRoundStartedAt(now);
+    state.setRoundDeadlineAt(roundDeadline);
+    state.setRoundStartSeq(sessionStore.currentSeq(state.getSessionId()));
+    state.setCursor(state.getRoundStartSeq());
+    state.setCurrentOpinions(new ArrayList<>());
+    state.setSilentAgents(new ArrayList<>());
+    state.setRetriedAgents(new ArrayList<>());
+    state.setSkipReasons(new LinkedHashMap<>());
+    state.setPollDelayMs(50L);
+    state.setPostDeadlineAt(now + Math.max(1000L, properties.getPostWindowMs()));
+
+    // 给每个投票者生成待投递任务
+    List<PendingTurn> turns = new ArrayList<>();
+    for (String voter : voterIds(state)) {
+        turns.add(newTurn(state, nextRound, 1, voter, "ROUND"));
+    }
+    state.setPendingTurns(turns);
+
+    // 把动作挂到 StepPlan 上
+    plan.postTurns = new ArrayList<>(turns);
+    plan.scheduleAt = state.getPostDeadlineAt();
+
+    log.info("[Negotiation] 开始第 {} 轮 | negotiation={} | session={} | voters={} | 截止={}ms后",
+            nextRound, state.getNegotiationId(), state.getSessionId(), voterIds(state),
+            roundDeadline - now);
+    return state;
+}
+```
+
+#### 收回复+补投递+自适应轮询——pollReplies
+
+这个方法在 `WAITING_REPLIES` 状态下被调用，负责收集各 Agent 的回复、处理投递异常、决定是继续等还是进入决策
+
+```java
+private NegotiationState pollReplies(NegotiationState state, StepPlan plan) {
+
+    // 从会话里读新消息
+    long now = now();
+    List<A2aMessage> incoming;
+    try {
+        incoming = sessionManager.messages(state.getSessionId(), state.getCursor()); // state.getCursor() 是上次读到的消息序号
+    } catch (RuntimeException e) {
+        return fail(state, "SESSION_UNAVAILABLE", messageOf(e), plan);
+    }
+
+    // 遍历消息，匹配并记录意见
+    for (A2aMessage message : incoming) {
+        state.setCursor(Math.max(state.getCursor(), message.getSeq()));
+        // 每条消息带着 replyTo（它是回复哪条 SOLICIT 的），SOLICIT 是“意见征询”消息类型
+        String replyTo = message.getReplyTo();
+        if (replyTo == null) {
+            continue;
+        }
+        // 拿这个 replyTo 去 pendingTurns 里找对应的投递项
+        PendingTurn turn = state.pendingTurnFor(replyTo);
+        if (turn == null) {
+            continue;
+        }
+        if (!turn.getAgentId().equals(message.getFromAgentId())) {
+            // replyTo 是发送方自填的，不可信。必须同时校验 fromAgentId：
+            // 只有被征询者本人回复的，才算它的表态；否则丢弃，
+            // 避免错配回复顶替掉真正待回复的 turn。
+            log.warn("[Negotiation] 回复发送方与 turn 不符，已忽略 | negotiation={} | "
+                            + "expected={} | actual={} | messageId={}",
+                    state.getNegotiationId(), turn.getAgentId(),
+                    message.getFromAgentId(), message.getMessageId());
+            continue;
+        }
+        // 这个 Agent 还没记过意见，就解析后加进去（防止收到重复回复）
+        if (state.opinionOf(turn.getAgentId()) == null) {
+            state.getCurrentOpinions().add(parseOpinion(state, turn, message));
+        }
+        // 从 pendingTurns 里删除
+        removePending(state, replyTo);
+    }
+
+    // 遍历还没回复的 turn，检查投递状态
+    // 不只是 "等回复"，还负责发现投递出问题的 turn
+    List<PendingTurn> remaining = state.getPendingTurns() == null
+            ? List.of() : new ArrayList<>(state.getPendingTurns());
+    for (PendingTurn turn : remaining) {
+        // 先查会话日志：这条 SOLICIT 消息到底落盘没有？
+        boolean persisted = sessionStore.findMessage(state.getSessionId(),
+                turn.getMessageId()).isPresent();
+        // 消息没落盘（投递可能失败了）
+        if (!persisted) {
+            String guard = turnGuard.stateOf(turn.getMessageId());
+            if (guard != null && guard.startsWith("SUCCEEDED")) {
+                // 闸说投过、日志里没有：以日志为准，清掉闸再重投
+                turnGuard.remove(turn.getMessageId());
+                guard = null;
+            }
+            if (guard == null || guard.startsWith("FAILED")
+                    || turnGuard.isStaleRunning(guard)) {
+                // TurnGuard 给每条 turn 维护一个 Redis 槽位，值有 3 种
+                // 其中之一 RUNNING:<时间戳> 代表已经有人举手去投这条消息了
+                // 任务可能死了却没有标记 FAILED
+                // 超过 turn-post-timeout-ms 就当作上一任已死，允许重投
+                // 重投本身仍受执行闸的 CAS 保护，同一时刻只有一个执行者
+                plan.addRepost(turn);
+            }
+            continue;
+        }
+        // 消息落盘了（投出去了，但对方没回）
+        if (turn.getPostedAt() == 0) {
+            turn.setPostedAt(now);
+        }
+        // 5s 后 rewake 一次
+        boolean stale = now - turn.getPostedAt() > Math.max(1000L, properties.getWakeTimeoutMs());
+        // rewakeCount == 0 保证只重唤醒一次，不无限重试
+        if (turn.getRewakeCount() == 0
+                && (turn.getDeliveryError() != null || stale)) {
+            turn.setRewakeCount(1); 
+            plan.addRewake(turn);
+        }
+    }
+
+    // 所有 turn 都收到回复了 → 进入一轮结束的决策逻辑
+    if (state.getPendingTurns() == null || state.getPendingTurns().isEmpty()) {
+        return decide(state, plan);
+    }
+    // 到了本轮截止时间→ 没回复的人沿用上一轮表态，然后进入决策
+    if (now >= state.getRoundDeadlineAt()) {
+        carryForwardSilent(state, now);
+        return decide(state, plan);
+    }
+
+    // 还在等 → 安排下一次轮询
+    // 延迟自适应退避：50ms → 100 → 200 → 400 → 800 → 1000ms
+    // 为什么自适应退避：如果一直没人回（对端慢、限流、挂了），还每 50ms 查一次就是空转 —— 每次都要读 Redis、读会话日志、解析空列表，纯属浪费
+    long delay = nextPollDelay(state.getPollDelayMs());
+    state.setPollDelayMs(delay);
+    plan.scheduleAt = Math.min(now + delay, state.getRoundDeadlineAt());
+    return state;
+}
+```
+
+这个方法解决了什么问题：
+
+回复发错了（B回了A的turn）—— fromAgent 校验，丢弃
+
+同一条回复收到多次 —— opinionOf == null 才记录
+
+投递闸说成功了但日志里没有 —— 以日志为准，清闸重投
+
+投递任务死在执行器里，槽停在 RUNNING —— isStaleRunning 超时回收重投
+
+消息发出去了但对端没收到通知 —— 5 秒后 re-wake 一次
+
+有人一直不回复 —— 轮截止后沿用上一轮表态，不无限等
+
+一直没人回复，轮询太频繁 —— 自适应退避 50ms→1000ms
+
+#### 一轮结束的收敛判定——decide
+
+在一轮回复收齐后（或截止）后被调用，负责回答：这一轮结束了，接下来该干什么
+
+```java
+private NegotiationState decide(NegotiationState state, StepPlan plan) {
+    long now = now();
+    List<Opinion> opinions = opinionsOf(state);
+
+    // 执行失败（答复回来了但 success=false）的成员就地补问一次。这种属于没回答好。
+    // 处理方式：同一轮内补问一次，然后直接返回（指跳过后续代码执行，因为轮次没结束还没到 decide 的时候） —— 本轮还没结束，等补问的回复。
+    // 单纯的慢并不重问
+    List<String> failed = failedAttempts(state);
+    long elapsed = Math.max(0L, now - state.getRoundStartedAt());
+    if (!failed.isEmpty() && now < state.getRoundDeadlineAt()
+            && NegotiationDeadlinePolicy.fits(now, elapsed, state.getRoundDeadlineAt())) {
+        retryFailed(state, plan, failed);
+        return state;
+    }
+
+    // 计算关键指标
+    state.setRoundMillis(elapsed);
+    // 本轮意见的指纹（谁投了什么票、提了什么候选），用来判断和上一轮是否一样
+    String fingerprint = NegotiationAggregator.fingerprint(opinions);
+    boolean quorum = quorumReached(state);
+    boolean unanimous = !isPanel(state) && quorum
+            && NegotiationAggregator.unanimous(opinions);
+    Optional<Opinion> veto = NegotiationAggregator.vetoing(opinions, vetoSet(state));
+    // 连续两轮指纹相同（意见已经收敛了，再谈也不会变）
+    boolean stable = stable(state, opinions, fingerprint);
+    // 然后把本轮快照写进轮次历史。
+    appendRoundRecord(state, fingerprint, unanimous, veto.isPresent(), elapsed, now);
+
+    log.info("[Negotiation] 本轮结束 | negotiation={} | round={} | replied={}/{} | "
+                    + "quorum={} | unanimous={} | stable={} | vetoed={} | 用时={}ms",
+            state.getNegotiationId(), state.getRound(),
+            presentVoters(state).size(), voterIds(state).size(),
+            quorum, unanimous, stable, veto.isPresent(), elapsed);
+
+    // 持 VETO 角色的 Agent（比如安全审查）投了反对。立即终止，不等其他轮次。
+    if (veto.isPresent()) {
+        return finishVeto(state, plan, veto.get().agentId());
+    }
+    // 超时直接收尾
+    if (now >= state.getDeadlineAt()) {
+        return finishTimeout(state, plan, "DEADLINE_REACHED", "协商在时限内未完成");
+    }
+
+    // 被熔断/舱壁跳过的成员本轮根本没有 turn，再开一轮也只会重复问在场的人：
+    // 缺席不是「慢」，重问不会让它出现。缺法定人数时直接收尾并报 no_quorum。
+    boolean unreachable = !quorum && state.getSkipReasons() != null
+            && !state.getSkipReasons().isEmpty();
+    boolean stopRounds = unanimous || stable || unreachable
+            || state.getRound() >= maxRounds;
+    if (!stopRounds && negotiableAnotherRound(state, now)) {
+        return beginRound(state, plan);
+    }
+    // panel 模式
+    if (isPanel(state)) {
+        return startSynthesis(state, plan);
+    }
+    // supervisor 模式
+    if (isSupervisor(state)) {
+        return startSupervisor(state, plan);
+    }
+    // 普通投票模式
+    return finishAggregate(state, plan);
+}
+```
 
 ### 投递执行器——NegotiationDelivery
 
+#### 
 
+#### CAS 成功后的总调度——execute()
+
+状态已经写进 Redis 了，现在把 plan 里登记的动作真正执行掉
+
+做什么：
+
+遍历要投递的 turn，过熔断检查，扔到投递线程池里异步发
+
+遍历要重唤醒的 turn，扔到唤醒线程池
+
+取消上一次安排的定时器（避免旧的定时器触发重复推进）
+
+如果不是终态，按 plan 里的时间安排下一次推进的定时器
+
+如果是终态，做资源清理
+
+```java
+private void execute(StepPlan plan) {
+    // 遍历要投递的每个 turn，对每个做三件事
+    for (PendingTurn turn : plan.postTurns) {
+        // 过熔断/舱壁检查
+        // 熔断检查：这个 Agent 是不是最近一直在挂
+        // 舱壁检查：这个 Agent 当前同时有几条投递正在进行中？是不是超过上限了？
+        PeerCircuitBreaker.Skip skip = peers.tryAcquire(turn.getAgentId());
+        if (skip != null) {
+            // 跳过不是弃权：写进 skipReasons，最终出现在 partyStates 里
+            recordSkip(plan, turn, skip);
+            continue;
+        }
+        try {
+            // 放进投递线程池
+            turnExecutor.execute(() -> postTurn(plan, turn));
+        } catch (RejectedExecutionException e) {
+            // 刚才那个许可因为投递没真的发生，不该被占着，还回去让后面真正的投递能用
+            // 这条 turn 还在状态的 pendingTurns 里，下一轮轮询时会重新检查、重新投递
+            peers.release(turn.getAgentId());
+            peers.onSettled(turn.getAgentId());
+            log.warn("[Negotiation] 投递池已满，turn 留给轮截止/恢复 | negotiation={} | messageId={}",
+                    plan.negotiationId, turn.getMessageId());
+        }
+    }
+
+    // 遍历要重唤醒的 turn
+    for (PendingTurn turn : plan.rewakeTurns) {
+        try {
+            // 扔到专门的唤醒线程池，池满了就跳过这次唤醒 —— 下次轮询还会再检查
+            deliverExecutor.execute(() -> rewake(plan, turn));
+        } catch (RejectedExecutionException e) {
+            log.warn("[Negotiation] 唤醒池已满，跳过本次 re-wake | negotiation={} | messageId={}",
+                    plan.negotiationId, turn.getMessageId());
+        }
+    }
+
+    cancelTimer(plan.negotiationId);
+
+    // 终态清理
+    // 摘活跃索引、释放租约和许可、注销信号、关闭会话
+    if (plan.finish) {
+        NegotiationState state = stateStore.find(plan.negotiationId).orElse(null);
+        if (state != null) {
+            cleanup(state);
+        }
+        return;
+    }
+
+    // 协商还在中间状态，就在指定时间点安排下一次推进
+    if (plan.scheduleAt > 0) {
+        long delay = Math.max(1L, plan.scheduleAt - now());
+        String id = plan.negotiationId;
+        try {
+            ScheduledFuture<?> future = timer.schedule(() -> signalBus.signal(id),
+                    delay, TimeUnit.MILLISECONDS);
+            timers.put(id, future);
+        } catch (RejectedExecutionException e) {
+            log.warn("[Negotiation] 定时器已关闭，无法安排下一次推进 | negotiation={}", id);
+        }
+    }
+}
+```
+
+指定时间是怎么算的？
 
 ## 多副本安全的实现——NegotiationStateStore的transition方法
 
