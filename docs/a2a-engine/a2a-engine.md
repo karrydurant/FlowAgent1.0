@@ -466,9 +466,94 @@ private void onPosted(StepPlan plan, PendingTurn turn, String token, Throwable e
 
 ## 多副本安全的实现——NegotiationStateStore的transition方法
 
-```java
+这是协商引擎状态写入的唯一通道，所有状态修改都走这个方法。一次状态转换：校验 epoch 与允许的旧状态，改副本，整文档 CAS 写回。
 
+```java
+public boolean transition(String negotiationId, long expectedEpoch, Collection<Status> allowed,
+                          UnaryOperator<NegotiationState> mutator) {
+    Set<Status> permitted = allowed == null || allowed.isEmpty()
+            ? EnumSet.noneOf(Status.class)
+            : EnumSet.copyOf(allowed);
+    RBucket<String> bucket = redissonClient.getBucket(stateKey(negotiationId));
+
+    // CAS 重试循环
+    for (int attempt = 0; attempt < Math.max(1, properties.getCasRetries()); attempt++) {
+        // 读旧状态
+        String oldRaw = bucket.get();
+        if (oldRaw == null) {
+            return false;
+        }
+        NegotiationState current;
+        try {
+            current = JSON.parseObject(oldRaw, NegotiationState.class);
+        } catch (RuntimeException e) {
+            log.warn("[Negotiation] 状态 JSON 解析失败，放弃本次推进 | negotiation={} | error={}",
+                    negotiationId, e.getMessage());
+            return false;
+        }
+        if (current == null) {
+            return false;
+        }
+
+        // 终态不可覆盖
+        // 一场协商已经出了结果，但可能同时发生：
+        // 1. 协调者收尾：协商谈完了，写 CONCLUDED + 结果
+        // 2. 用户取消：用户点了取消按钮，想改成 CANCELLED
+        // 3. 接管耗尽：扫描器接管了 3 次都没成功，判 FAILED
+        if (current.getStatus() != null && current.getStatus().terminal()) {
+            return false;
+        }
+
+        // 读取到的当前 epoch 与本次推进者持有的栅栏令牌不一致，表明该推进者已在接管中失去主身份，本次转换作废。
+        if (current.getLeaseEpoch() != expectedEpoch) {
+            log.info("[Negotiation] 拒绝过期推进者 | negotiation={} | stateEpoch={} | mine={}",
+                    negotiationId, current.getLeaseEpoch(), expectedEpoch);
+            return false;
+        }
+
+        // 调用方声明“我只在状态是 X 时才做这个转换”
+        // 比如只允许从 WAITING_REPLIES 进入决策，如果当前已经是 RUNNING，说明别的推进者已经往前走了，这次作废
+        if (!permitted.isEmpty() && !permitted.contains(current.getStatus())) {
+            return false;
+        }
+
+        NegotiationState next;
+        try {
+            // 只改内存对象，不做任何网络 I/O, 因为 CAS 失败后会重试，mutator 会被执行多次，修改内存几乎没副作用
+            next = mutator.apply(current);
+        } catch (RuntimeException e) {
+            log.warn("[Negotiation] 状态转换失败 | negotiation={} | status={} | error={}",
+                    negotiationId, current.getStatus(), e.getMessage());
+            return false;
+        }
+        if (next == null) {
+            return false;
+        }
+        next.setUpdatedAt(System.currentTimeMillis());
+
+        // 在内存里改好 newRaw
+        String newRaw = JSON.toJSONString(next);
+
+        // "读旧值" 到 "写新值" 之间有时间窗口，如果直接写，可能覆盖掉别人在这期间的修改
+        if (bucket.compareAndSet(oldRaw, newRaw)) {
+            // Redisson 的 CAS 底层是 SET key newRaw，会把原来的 TTL 清掉，所以要补一次
+            bucket.expire(Duration.ofSeconds(properties.getStateTtlSeconds()));
+            return true;
+        }
+    }
+    log.info("[Negotiation] 状态 CAS 连续失败，放弃本次推进 | negotiation={} | attempts={}",
+            negotiationId, properties.getCasRetries());
+    return false;
+}
 ```
+
+epoch 栅栏是什么：
+
+epoch 就是一个单调递增的版本号，每次接管就 +1。旧主（当前负责推进这一场协商的那个进程）手里的版本号永远落后，所以它的写入会被自动拒绝 —— 不用锁，不用选举，靠版本号比对就保证了只有当前主能写。
+
+为什么 mutator 方法只修改内存：
+
+防止 CAS 多次重试的副作用
 
 ## 崩溃接管的实现——NegotiationSweeper的inspect方法
 
