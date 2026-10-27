@@ -14,11 +14,7 @@
 
 ## 状态字段——NegotiationState
 
-```java
-
-```
-
-## 业务流程——NegotiationCoordinator
+## 业务流程
 
 ### 轮次状态机
 
@@ -262,7 +258,7 @@ private NegotiationState decide(NegotiationState state, StepPlan plan) {
 }
 ```
 
-### 投递执行器——NegotiationDelivery
+### 投递执行器
 
 #### 
 
@@ -347,6 +343,126 @@ private void execute(StepPlan plan) {
 ```
 
 指定时间是怎么算的？
+
+
+#### 真正发一条消息——postTurn
+
+它是把一条待投递的 turn 真正发给目标 Agent 的过程
+
+做什么：
+
+1.先抢投递闸，保证同一个 turn 不会被两个线程同时投
+
+2.重新读一次最新状态 —— 因为从创建 turn 到现在，轮次可能已经被推进了，这时候这条 turn 已经过期了，直接标失败放弃
+
+3.根据状态和 turn 构造要发的 A2aMessage
+
+```java
+private void postTurn(StepPlan plan, PendingTurn turn) {
+    // 抢投递闸
+    String token = turnGuard.tryBegin(turn.getMessageId());
+    // 抢不到说明这条 turn 已经被别的线程在投了（或者已经投成功过了），直接放弃，归还舱壁许可
+    if (token == null) {
+        peers.release(turn.getAgentId());
+        peers.onSettled(turn.getAgentId());
+        return;
+    }
+    // 读最新状态
+    // 因为这条 turn 是在 CAS 之前创建的，从创建到现在可能过了一段时间 —— 状态可能已经变了
+    NegotiationState state;
+    try {
+        state = stateStore.find(plan.negotiationId).orElse(null);
+    } catch (RuntimeException e) {
+        // 读状态撞上 Redis 故障：任务就这么死在执行器里，没人把槽标成 FAILED，
+        // 轮询会一直把它当成「还有人正在投」，直到 turn-post-timeout-ms 后才回收。
+        try {
+            // 标记失败
+            turnGuard.fail(turn.getMessageId(), token, messageOf(e));
+        } catch (RuntimeException failError) {
+            // 连标失败都做不到（Redis 还没回来）：槽会在超时后被轮询回收
+            log.debug("[Negotiation] 标记投递失败也失败了 | negotiation={} | messageId={} | error={}",
+                    plan.negotiationId, turn.getMessageId(), failError.toString());
+        }
+        // 但舱壁许可必须还回去，否则这个 peer 的并发额度就永久少一个。
+        peers.release(turn.getAgentId());
+        peers.onSettled(turn.getAgentId());
+        // 发信号让协调者再推进一次
+        // 这样马上就会重新检查 pendingTurns，发现这条是 FAILED，立刻重投。不用等下一次定时器触发。
+        signalBus.signal(plan.negotiationId);
+        return;
+    }
+    // 检查状态还有效吗
+    if (state == null || state.isTerminal() || state.getRound() != turn.getRound()) {
+        turnGuard.fail(turn.getMessageId(), token, "round advanced");
+        peers.release(turn.getAgentId());
+        peers.onSettled(turn.getAgentId());
+        return;
+    }
+    // 构造消息
+    A2aMessage message;
+    try {
+        message = buildMessage(state, turn);
+    } catch (RuntimeException e) {
+        // 构造失败标失败、归还许可
+        turnGuard.fail(turn.getMessageId(), token, messageOf(e));
+        peers.release(turn.getAgentId());
+        peers.onSettled(turn.getAgentId());
+        return;
+    }
+    // 异步发送，发完不等结果
+    try {
+        sessionManager.postAsync(plan.sessionId, message)
+                .whenComplete((ignored, error) -> onPosted(plan, turn, token, error));
+    } catch (RuntimeException e) {
+        onPosted(plan, turn, token, e);
+    }
+}
+```
+
+解决的问题：
+
+1.同一条 turn 会不会被重复投
+
+2.turn 是否还有效
+
+3.出错了如何兜底
+
+#### 投递回调——onPosted
+
+```java
+private void onPosted(StepPlan plan, PendingTurn turn, String token, Throwable error) {
+    try {
+        // 先查会话日志：这条 SOLICIT 消息是否落盘了
+        boolean persisted = sessionStore.findMessage(plan.sessionId, turn.getMessageId())
+                .isPresent();
+        // 正常投递成功或是消息落盘但唤醒对端失败都算"投出去了"
+        if (error == null || persisted) {
+            turnGuard.succeed(turn.getMessageId(), token);
+            if (error != null) {
+                markDeliveryError(plan.negotiationId, turn.getMessageId(), messageOf(error));
+                peers.onFailure(turn.getAgentId());
+            } else {
+                markPosted(plan.negotiationId, turn.getMessageId());
+                peers.onSuccess(turn.getAgentId());
+            }
+        } else {
+            // 消息根本没发出去，标闸失败，下次轮询会重投。
+            turnGuard.fail(turn.getMessageId(), token, messageOf(error));
+            markDeliveryError(plan.negotiationId, turn.getMessageId(), messageOf(error));
+            peers.onFailure(turn.getAgentId());
+        }
+    } catch (RuntimeException e) {
+        // 确认落盘这一步本身撞上 Redis 故障：不能猜「投过了」，也不能把槽留在
+        // RUNNING。标 FAILED 让轮询重投；重投前会先查日志，真落过盘就不会再发。
+        turnGuard.fail(turn.getMessageId(), token, messageOf(e));
+    } finally {
+        // 还舱壁许可
+        peers.release(turn.getAgentId());
+        // 发信号让协调者继续推进
+        signalBus.signal(plan.negotiationId);
+    }
+}
+```
 
 ## 多副本安全的实现——NegotiationStateStore的transition方法
 
