@@ -14,6 +14,16 @@
 
 ## 状态字段——NegotiationState
 
+字段	为什么重要
+status	状态机核心，决定当前在哪个阶段（等回复？决策？收尾？）
+round	当前第几轮，开了几轮了
+pendingTurns	还在等谁回复，每个 turn 对应一个 Agent
+currentOpinions	已经收到的意见，决策时用
+leaseEpoch	多副本安全的栅栏，旧主写入被拒绝靠它
+result	最终结果（决策、理由）
+voterIds	参与投票的都有谁
+deadlineAt	整场截止时间，到点必须收尾
+
 ## 业务流程
 
 ### 轮次状态机
