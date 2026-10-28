@@ -113,3 +113,5 @@ http://localhost:8081/swagger-ui.html
 ## [人工审批与挂起恢复](docs/human-approve/human-approve.md)
 
 ## [Agent 注册与能力发现](docs/agent-registry/agent-registry.md)
+
+## [链路追踪与成本监控](docs/trace/trace.md)
