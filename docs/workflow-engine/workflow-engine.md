@@ -253,8 +253,109 @@ private void executeLayer(WorkflowDefinition def, WorkflowRun run,
 
 读 Redis checkpoint → 校验双指纹 → 重建内存状态
 
+```java
+private WorkflowRun prepareResume(WorkflowDefinition definition, WorkflowRun run) {
+    String runId = run.getRunId();
+    if (definition == null) {
+        throw FlowAgentException.businessError("INVALID_DEFINITION", "工作流定义不能为空");
+    }
+    // 先校验 DAG 本身合法
+    DagValidator.validate(definition);
 
+    String currentFingerprint = definition.fingerprint();
+    String snapshotFingerprint = run.getDefinitionFingerprint();
+    // 结构指纹（拓扑有没有变）
+    if (snapshotFingerprint != null && !snapshotFingerprint.equals(currentFingerprint)) {
+        throw FlowAgentException.businessError("DEFINITION_CHANGED",
+                "工作流定义已变更，无法从旧 Checkpoint 恢复（快照=" + snapshotFingerprint
+                        + ", 当前=" + currentFingerprint + "）。请重新发起一次执行。");
+    }
+    if (snapshotFingerprint == null) {
+        // 兼容本次改动之前保存的老快照：无指纹可比，放行但留痕
+        log.warn("[Executor] checkpoint 无定义指纹（旧版本快照），跳过一致性校验 | runId={}", runId);
+        run.setDefinitionFingerprint(currentFingerprint);
+    }
+
+    // 执行配置也必须一致。结构指纹只覆盖拓扑，改 prompt / 工具参数 / 超时 /
+    // 降级策略 / 节点顺序都不会被上面那道门发现；
+    // 旧快照没有这个字段（null），放行并就地升级，避免这次改动把存量快照一次性判死。
+    String currentExecutionFingerprint = definition.executionFingerprint();
+    String snapshotExecutionFingerprint = run.getExecutionFingerprint();
+    if (snapshotExecutionFingerprint != null
+            && !snapshotExecutionFingerprint.equals(currentExecutionFingerprint)) {
+        throw FlowAgentException.businessError("DEFINITION_CHANGED",
+                "工作流执行配置已变更，无法从旧 Checkpoint 恢复（快照="
+                        + snapshotExecutionFingerprint + ", 当前=" + currentExecutionFingerprint
+                        + "）。请重新发起一次执行。");
+    }
+    if (snapshotExecutionFingerprint == null) {
+        log.info("[Executor] checkpoint 无执行配置指纹（旧版本快照），跳过校验并升级 | runId={}",
+                runId);
+        run.setExecutionFingerprint(currentExecutionFingerprint);
+    }
+
+    // 状态必须可恢复，已经跑完的、被取消的，不能恢复
+    WorkflowRun.RunStatus status = run.getStatus();
+    if (status == WorkflowRun.RunStatus.COMPLETED) {
+        throw FlowAgentException.businessError("ALREADY_COMPLETED",
+                "工作流已执行完成，无需恢复: " + runId);
+    }
+    if (status == WorkflowRun.RunStatus.CANCELLED) {
+        throw FlowAgentException.businessError("RUN_CANCELLED",
+                "工作流已被取消，不允许恢复: " + runId);
+    }
+
+    // 并发检查 —— 是不是已经有人在跑了
+    // containsKey：同 JVM 内部二次调用
+    // isHeld：多副本
+    if (runningWorkflows.containsKey(runId) || leaseManager.isHeld(runId)) {
+        throw FlowAgentException.conflict("工作流正在运行中，不能重复恢复: " + runId
+                + "（若对端实例已崩溃，租约将在 " + leaseManager.watchdogMillis() / 1000
+                + "s 内自动释放，请稍后重试）");
+    }
+
+    // 清理中断残留：崩溃时 activeNodeIds 里的节点并未完成，需重跑；
+    // failedNodeIds 同理清空，否则重跑成功后失败记录仍在，状态自相矛盾。
+    // blockedNodeIds 与 failedNodeIds 同去同留 —— 它记的是「上游断了所以没跑」，失败节点要重跑，下游就该解冻。
+    // 不清的后果：上游重跑成功了，下游却永远不跑，而且连日志都没有
+    // skippedNodeIds 刻意保留 —— 和 completedNodeIds 一样，跳过是「已经定下来的结论」
+    List<String> interrupted = new ArrayList<>(run.getActiveNodeIds());
+    List<String> previouslyFailed = new ArrayList<>(run.getFailedNodeIds());
+    List<String> previouslyBlocked = new ArrayList<>(run.getBlockedNodeIds());
+    run.getActiveNodeIds().clear();
+    run.getFailedNodeIds().clear();
+    run.getBlockedNodeIds().clear();
+    run.setErrorMessage(null);
+    run.setCompletedAt(null);
+    run.setResumeCount(run.getResumeCount() + 1);
+
+    run.addTimelineEvent("WORKFLOW_RESUME", run.getLastCheckpointNodeId(),
+            String.format("从 Checkpoint 恢复（第 %d 次）| 已完成 %d 节点 | 待重跑: %s",
+                    run.getResumeCount(), run.getCompletedNodeIds().size(),
+                    interrupted.isEmpty() && previouslyFailed.isEmpty()
+                            ? "无" : union(union(interrupted, previouslyFailed), previouslyBlocked)));
+
+    // 占用「本 JVM 正在跑它」的槽位。
+    // 这里必须用 putIfAbsent，不能像上面那道检查一样「先 containsKey 再 put」：
+    // 先检查再操作，不是原子的，两个线程完全可能同时通过第一步的检查，然后都执行第二步
+    // 可能会出现真正在跑的线程在记录里消失了
+    WorkflowRun holder = runningWorkflows.putIfAbsent(runId, run);
+    if (holder != null) {
+        throw FlowAgentException.conflict("工作流正在运行中，不能重复恢复: " + runId);
+    }
+    finishedWorkflows.remove(runId);
+
+    log.info("[Executor] resuming | runId={} | resumeCount={} | completed={} | skipped={} | interrupted={} | failed={} | unblocked={}",
+            runId, run.getResumeCount(), run.getCompletedNodeIds().size(),
+            run.getSkippedNodeIds().size(), interrupted, previouslyFailed, previouslyBlocked);
+    return run;
+}
+```
 
 ### 节点调度判断——shouldExecuteNode
 
 上游失败了要不要跳过、条件分支选没选它。决定了 "哪些节点真的会被执行"
+
+```java
+
+```
