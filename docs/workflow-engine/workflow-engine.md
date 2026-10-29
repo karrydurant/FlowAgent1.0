@@ -359,3 +359,70 @@ private WorkflowRun prepareResume(WorkflowDefinition definition, WorkflowRun run
 ```java
 
 ```
+
+### 一些设计思路
+
+#### 设置三个不同线程池分别负责工作流、层、节点三类任务，避免了单池可能产生的死锁
+
+```java
+/**
+ * 层内编排线程池 — 只负责「提交节点任务 + 等待结果」，不跑节点业务逻辑。
+ * 这里的线程会阻塞在 future.get(timeout) 上，因此必须与真正执行节点的 {@link #nodeCallExecutor} 分离。  * 二者共用一个池会死锁：
+ * 本池 core=4、队列容量 512，队列未满时不会扩容到 max，于是 4 个编排任务占满线程后，
+ * 它们提交的节点任务只能排在队列里，永远等不到线程 —— 整层节点集体超时。
+ * （4 路以上并行才会触发）
+ */
+private final ExecutorService layerExecutor = new ThreadPoolExecutor(
+        4, 64, 60L, TimeUnit.SECONDS,
+        // SynchronousQueue 而非 LinkedBlockingQueue：
+        // 这里的线程绝大部分时间在阻塞等待
+        // 用有界队列会让任务排队而不是扩容
+        // ThreadPoolExecutor 只在队列满时才扩到 max（基本不会满），实际并行度被死锁在 core=4 上，maxConcurrency 配再大也没用。
+        new SynchronousQueue<>(),
+        r -> new Thread(r, "flowagent-layer-" + UUID.randomUUID().toString().substring(0, 4)),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+);
+
+/** 节点执行线程池 — 真正运行 {@link NodeExecutor#execute} 的地方 */
+private final ExecutorService nodeCallExecutor = new ThreadPoolExecutor(
+        8, 64, 60L, TimeUnit.SECONDS,
+        // 同上：按需扩容。真正的并发上限由 WorkflowConfig.maxConcurrency 的信号量控制，线程池只负责"不要成为瓶颈"。
+        new SynchronousQueue<>(),
+        r -> new Thread(r, "flowagent-node-" + UUID.randomUUID().toString().substring(0, 4)),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+);
+
+/** 工作流执行线程池（异步提交用，与节点级线程池分离，避免相互阻塞） */
+private final ExecutorService workflowExecutor = new ThreadPoolExecutor(
+        2, 8, 60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(256),
+        r -> new Thread(r, "flowagent-workflow-" + UUID.randomUUID().toString().substring(0, 4)),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+);
+```
+
+##### 三个线程池的相关配置
+
+```mermaid
+| 配置项 | `workflowExecutor`<br>工作流提交池 | `layerExecutor`<br>层内编排池 | `nodeCallExecutor`<br>节点执行池 |
+|---|---|---|---|
+| corePoolSize | 2 | 4 | 8 |
+| maxPoolSize | 8 | 64 | 64 |
+| keepAliveTime | 60s | 60s | 60s |
+| 工作队列 | `LinkedBlockingQueue(256)` | `SynchronousQueue` | `SynchronousQueue` |
+| 拒绝策略 | `CallerRunsPolicy` | `CallerRunsPolicy` | `CallerRunsPolicy` |
+| 职责 | 接收新 run 的异步提交入口 | 提交同层节点任务后阻塞在 `future.get()` 等结果，不跑节点业务 | 真正执行 `NodeExecutor.execute`，跑节点业务逻辑 |
+| 扩容行为 | 256 容量内排队，满了才扩到 max=8 | 无队列缓冲，无空闲线程立即扩容到 max=64 | 无队列缓冲，无空闲线程立即扩容到 max=64 |
+```
+
+##### 任务在三个线程池之间的流转过程
+
+##### 遇到过的死锁情况
+
+#### Redis 存储节点 checkpoint，实现中断或失败后的运行从最近快照续跑，已完成节点不重跑；恢复侧对双指纹（拓扑结构 + 执行配置）和运行状态进行校验，拒绝错误续跑。
+
+##### 双指纹（拓扑结构 + 执行配置）具体 hash 的字段（一个节点改了提示词算不算指纹变化）
+
+##### checkpoint 存在 Redis 中，数据结构是什么？一个复杂的 DAG 快照多大？
+
+##### 恢复时怎么知道哪些节点完成了、哪些在跑
