@@ -403,7 +403,6 @@ private final ExecutorService workflowExecutor = new ThreadPoolExecutor(
 
 ##### 三个线程池的相关配置
 
-```markdown
 | 配置项 | `workflowExecutor`<br>工作流提交池 | `layerExecutor`<br>层内编排池 | `nodeCallExecutor`<br>节点执行池 |
 |---|---|---|---|
 | corePoolSize | 2 | 4 | 8 |
@@ -413,7 +412,6 @@ private final ExecutorService workflowExecutor = new ThreadPoolExecutor(
 | 拒绝策略 | `CallerRunsPolicy` | `CallerRunsPolicy` | `CallerRunsPolicy` |
 | 职责 | 接收新 run 的异步提交入口 | 提交同层节点任务后阻塞在 `future.get()` 等结果，不跑节点业务 | 真正执行 `NodeExecutor.execute`，跑节点业务逻辑 |
 | 扩容行为 | 256 容量内排队，满了才扩到 max=8 | 无队列缓冲，无空闲线程立即扩容到 max=64 | 无队列缓冲，无空闲线程立即扩容到 max=64 |
-```
 
 ##### 任务在三个线程池之间的流转过程
 
