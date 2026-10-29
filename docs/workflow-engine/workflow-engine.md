@@ -413,9 +413,27 @@ private final ExecutorService workflowExecutor = new ThreadPoolExecutor(
 | 职责 | 接收新 run 的异步提交入口 | 提交同层节点任务后阻塞在 `future.get()` 等结果，不跑节点业务 | 真正执行 `NodeExecutor.execute`，跑节点业务逻辑 |
 | 扩容行为 | 256 容量内排队，满了才扩到 max=8 | 无队列缓冲，无空闲线程立即扩容到 max=64 | 无队列缓冲，无空闲线程立即扩容到 max=64 |
 
+##### 拒绝策略为什么全是 CallerRunsPolicy
+
+
+
+##### 为什么 layer 和 node 池用 SynchronousQueue 而不是有界队列
+
+因为 ThreadPoolExecutor 只在队列满时才扩容到 maxPoolSize。
+
+如果 layer 池用 LinkedBlockingQueue，core=4 个线程占满后，新的任务进来不会马上扩容（由于队列太长排不满线程池几乎不会扩容），并发度锁死在 core=4。SynchronousQueue 不存任务，直接交给线程或扩容，所以能按需扩到 max=64。
+
+如果再加上使用的是同一个线程池，而不是分为 3个，core=4 个线程被等结果的任务占满，执行并返回结果的线程就只能排队列里，几乎等不到线程来接管的时机，就形成了死循环。
+
 ##### 任务在三个线程池之间的流转过程
 
-##### 遇到过的死锁情况
+首先请求进来后，整个工作流的执行先交给 workflow 池——core=2、有界队列 256，负责异步拉起一个工作流实例。它在这个线程里抢到 Redis 分布式锁、对 DAG 做 Kahn 拓扑排序分出 L1/L2/L3 各层，然后逐层推进。
+
+每一层的调度交给 layer 池。layer 池的线程只做一件事：把这一层的节点任务全部派发到 node 池，然后阻塞在 future.get() 上等结果。等这一层全部节点回来，判断哪些成功、哪些走了降级、哪些被上游拦住，再决定下一层怎么路由。
+
+节点真正的业务执行在 node 池。
+
+##### 工作流级超时到了，正在 acquire 排队的节点怎么办
 
 #### Redis 存储节点 checkpoint，实现中断或失败后的运行从最近快照续跑，已完成节点不重跑；恢复侧对双指纹（拓扑结构 + 执行配置）和运行状态进行校验，拒绝错误续跑。
 
