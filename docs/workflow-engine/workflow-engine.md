@@ -403,7 +403,7 @@ private final ExecutorService workflowExecutor = new ThreadPoolExecutor(
 
 ##### 三个线程池的相关配置
 
-```mermaid
+```markdown
 | 配置项 | `workflowExecutor`<br>工作流提交池 | `layerExecutor`<br>层内编排池 | `nodeCallExecutor`<br>节点执行池 |
 |---|---|---|---|
 | corePoolSize | 2 | 4 | 8 |
