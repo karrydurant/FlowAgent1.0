@@ -20,8 +20,8 @@
 private void executeNodeWithRetries(WorkflowDefinition def, WorkflowRun run,
                                     String nodeId, WorkflowNode node,
                                     Deadline deadline, NodeTrace trace) {
-    // 排队等信号量的节点可能在上游已经超时 / 失败之后才轮到。
-    // 此时不要再开始执行，更不要执行完再提交结果 —— 直接把这次执行当作没发生过。
+    // 排队等信号量的节点可能在工作流已经超时 / 失败之后才轮到。
+    // 此时不要再开始执行，更不要执行完再提交结果
     if (isTerminal(run.getStatus())) {
         log.warn("[Executor] node not started: run already terminal | runId={} | node={} | status={}",
                 run.getRunId(), nodeId, run.getStatus());
@@ -45,7 +45,7 @@ private void executeNodeWithRetries(WorkflowDefinition def, WorkflowRun run,
 
     // 重试循环
     while (attempt <= node.getMaxRetries()) {
-        // 第一次尝试失败后，兄弟节点可能已经把工作流置成终态了（比如某个节点抛了致命异常，工作流状态变为 FAILED）
+        // 兄弟节点可能已经把工作流置成终态了（比如某个节点抛了致命异常，工作流状态变为 FAILED）
         if (isTerminal(run.getStatus())) {
             log.warn("[Executor] node retry aborted: run already terminal | runId={} | node={} | status={}",
                     run.getRunId(), nodeId, run.getStatus());
@@ -147,9 +147,17 @@ private void executeNodeWithRetries(WorkflowDefinition def, WorkflowRun run,
 }
 ```
 
-`Thread.sleep()` 被中断时，会抛出 `InterruptedException`，但同时会把中断标志清掉。
+层内节点通过 Semaphore 控制并发，节点需要先 acquire 一个信号量才能开始执行，第一步先确认工作流是否超时，是否已经因为其它节点的失败确认为失败，如果是的话就不必继续执行。
 
-`Thread.currentThread().interrupt();` 为什么要加这一行：因为外层可能还需要知道 "这个线程被中断过"。如果不恢复，中断信号就丢了 —— 上层以为一切正常，继续往下跑。
+继续执行，将当前 nodeId 加入 activeNodeIds 集合。进入重试循环，每次循环开头也检查一遍 "工作流是否超时，是否已经因为其它节点的失败确认为失败"，没有就继续执行，使用 ExecutorService.submit 提交节点任务，在等待结果期间如果节点任务线程被中断的话先 future.cancel() 终止节点执行然后外层 catch 异常后再处理；如果是超时也是先 future.cancel() 取消节点执行，但是这是允许重试的，设置了最大重试次数。另外挂起也被视为异常，但是不会重试。
+
+在处理中断异常的时候 `Thread.currentThread().interrupt();` 重新标记了一次中断，这是因为 `Thread.sleep()` 被中断时，会抛出 `InterruptedException`，但同时会把中断标志清掉，外层可能还需要知道 "这个线程被中断过"。如果不恢复，中断信号就丢了 —— 上层以为一切正常，继续往下跑。
+
+为什么等待结果期间会被中断：上层 executeLayer 中有 `futures.forEach(f -> f.cancel(true));` 中断节点执行
+
+中断信号就丢了 —— 上层以为一切正常，继续往下跑，这会产生什么后果，有没有具体例子：
+
+
 
 ### 层间执行——executeLayer
 
