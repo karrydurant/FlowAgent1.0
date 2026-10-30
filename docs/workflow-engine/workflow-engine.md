@@ -415,7 +415,13 @@ private final ExecutorService workflowExecutor = new ThreadPoolExecutor(
 
 ##### 拒绝策略为什么全是 CallerRunsPolicy
 
+一是不把瞬态过载当节点失败。 池满了是临时的，不是这个节点逻辑错了。AbortPolicy 会把它喂进已有的重试 / 降级流程 —— 本来等两秒就好，结果重试 N 次、走 SKIP、整轮报 PARTIAL_SUCCESS。CallerRunsPolicy 让提交者亲手把这个任务跑掉，结果正常回来，引擎无感知。
 
+二是天然背压。 提交者被拉去跑节点期间没法提交新任务，提交速度被强制降下来，跟消息队列消费者反压生产者一个道理。
+
+三是这些任务是 IO 阻塞型。 线程在等 LLM HTTP 响应，不占 CPU，压回提交者跑一会儿开销可忽略。如果是 CPU 密集型任务就不能这么选。
+
+代价是高负载时 HTTP 接口会变慢 —— 提交者被占用了。这是有意识的取舍，用延迟换不丢任务。
 
 ##### 为什么 layer 和 node 池用 SynchronousQueue 而不是有界队列
 
@@ -433,12 +439,90 @@ private final ExecutorService workflowExecutor = new ThreadPoolExecutor(
 
 节点真正的业务执行在 node 池。
 
-##### 工作流级超时到了，正在 acquire 排队的节点怎么办
+##### 节点超时怎么处理的
+
+节点超时可以分为节点本身没超时但全局超时、节点本身超时
+
+节点本身超时：节点使用的是 ExecutorService.submit() 提交的任务，`ExecutorService.submit()` 返回 `FutureTask`，`cancel(true)` 会调 `Thread.interrupt()`，正在阻塞 HTTP/sleep 的线程会立即抛 `InterruptedException` 退出
+
+全局超时：编排任务使用的是 CompletableFuture，因为他要等待整层节点的结果，处理如下
+
+##### 一层有 20 个节点并发，但 maxConcurrency=5，剩下 15 个还在等并发槽位。这时候整个工作流到了全局超时时间，这 15 个还没开始跑的节点怎么办
+
+全局超时后，编排线程立刻把整个运行标记成失败状态。正在跑的节点还有约 1 秒的节点超时窗口，之后被 interrupt 退出并释放并发槽。排队等槽位的节点不会被 `cancel(true)` 唤醒（这个 API 不 interrupt 线程），它们要等正在跑的节点释放槽位后一个接一个被唤醒 —— 但被唤醒后走进节点执行，第一行就检查运行状态，发现已经是失败了，直接返回不发请求，不烧 token。
+
+##### 层内并发是怎么控制的？如果不控制会怎样？
+
+不控制会怎么样：最直接的就是 LLM 和外部 API 被 429 限流，然后触发重试风暴——重试又发请求，又被限流，整层集体失败（多个节点进入重试，发起更多请求，请求又全部 429，所有节点重试耗尽，标记为失败，节点进入 failedNodeIds）
+
+每层用 Semaphore new 一个信号量
+
+##### 层之间，工作流之间是并发的吗
+
+层之间串行——拓扑排序逐层执行，当前层 all.get () 等完才进下一层。工作流之间是并行的，每个工作流提交到 workflowExecutor 异步跑。但三个线程池是单例共享的（资源利用率高），不是每个工作流独立。
+
+之所以没有做工作流级隔离：这个项目定位是单实例编排引擎，不是多租户 SaaS。线程池 max=64 已经是资源天花板，信号量 maxConcurrency=10 才是每个工作流自己的并发闸门。如果真要做多租户隔离，会用 `Semaphore` 在工作流级别再包一层，或者用独立的线程池分组。
 
 #### Redis 存储节点 checkpoint，实现中断或失败后的运行从最近快照续跑，已完成节点不重跑；恢复侧对双指纹（拓扑结构 + 执行配置）和运行状态进行校验，拒绝错误续跑。
 
 ##### 双指纹（拓扑结构 + 执行配置）具体 hash 的字段（一个节点改了提示词算不算指纹变化）
 
+结构指纹 `fingerprint()`，只覆盖拓扑结构，拼接后 SHA-256 取前 8 字节（16 位十六进制）。不纳入节点 name、description、labels—— 改个名字不该让已有 checkpoint 失效。
+
+执行配置指纹 `executionFingerprint()`，用反射遍历所有字段，纳入的是：
+
+节点列表的顺序——因为 `updateFinalAnswerNode` 用 `layer * 10000 + ordinal` 选最终答案，顺序变了答案可能变（可能有多个 AGENT 节点都输出了 `finalAnswer`，要根据拓扑结构的先后顺序决定选择哪个作为最终答案）
+
+节点的全部执行字段——超时时间、maxRetries、重试间隔、fallbackStrategy、所有 `*Config`(agentConfig、toolConfig、approvalConfig、judgeConfig 等)
+
+工作流级 WorkflowConfig——globalTimeoutSeconds、maxConcurrency、autoRetry、checkpointEnabled 等
+
 ##### checkpoint 存在 Redis 中，数据结构是什么？一个复杂的 DAG 快照多大？
 
+Redis 数据结构
+
+key——fa:workflow:ckpt:{runId}
+
+类型——RBucket<String>，就是一个 String key，值是 Fastjson2 序列化的整个 WorkflowRun JSON
+
+TTL——7天
+
+写入时机——每个节点完成后全量写入
+
+写入互斥——兄弟节点并发提交时，"写变量" 和 "序列化快照" 必须互斥，否则会拍到 "变量里已有输出、completedNodeIds 里还没记" 的中间状态，恢复时节点被重跑、副作用发生第二次
+
+快照里装了什么：
+
+`WorkflowRun` 对象序列化后的 JSON，主要字段：
+
+- 固定字段（小）：runId、workflowId、status、时间戳、两个指纹、resumeCount、suspendedApprovalNodeId/taskId—— 约 1-2KB
+  
+- 五个节点集合：activeNodeIds /completedNodeIds/failedNodeIds /skippedNodeIds/blockedNodeIds—— 每个就是节点 ID 字符串列表，几十到几百字节
+  
+- nodeResults：`Map<nodeId, NodeExecutionResult>`—— 每个节点的输入、输出、耗时、重试次数、状态
+  
+- variables：节点间传递的数据 ——这是快照大小的大头
+  
+- timeline：时间线事件列表，每个节点几条事件
+
+快照多大，取决于节点输出：
+
+| 场景 | 大小估算 |
+| ---- | ---- |
+| 5 个节点，TOOL 节点返回小结果（几 KB）|	~15-30KB JSON |
+| 10 个节点，含 AGENT 节点 LLM 回复 + TOOL 节点数据	| ~30-100KB JSON |
+| 大输出场景（TOOL 节点返回大段 SQL 结果 / HTTP 响应）| 几百 KB |
+
 ##### 恢复时怎么知道哪些节点完成了、哪些在跑
+
+恢复时靠五个集合区分节点状态。
+
+completedNodeIds 保留不重跑，输出已经在 variables 里了；
+
+skippedNodeIds 也保留 —— 条件跳过是定论，重算结果一样，清掉会重复判断。
+
+activeNodeIds 清空 —— 崩溃时正在跑的节点结果不可信，要重跑。
+
+failedNodeIds 和 blockedNodeIds 一起清空 —— 失败节点重试，被拦住的下游解冻。
+
+恢复后引擎从拓扑重新走一遍，已完成的跳过，中断和失败的重跑，被拦的等上游跑完再执行。
