@@ -620,3 +620,36 @@ private boolean inspect (String id) {
     }
 }
 ```
+
+## 实现投票、共识、否决、主管四种多 Agent 决策模式
+
+每种模式的输入都是一组 Opinion，每条包含：
+
+```java
+record Opinion(
+    String agentId,      // 谁表态的
+    Verdict verdict,     // approve / reject / abstain
+    double confidence,    // 0.0~1.0，Agent 自报
+    String reason,        // 一句话理由
+    List<Candidate> candidates  // 结构化候选（panel 模式用）
+)
+```
+
+Agent 回答必须是 JSON：`{"decision":"approve","confidence":0.8,"reason":"..."}`。解析不出来就记弃权
+
+### 投票模式
+
+规则：数票，谁多谁赢。弃权不算票。
+
+### 共识模式
+
+规则——必须所有人一致同意，一个人反对或弃权都不算达成。
+
+### 否决模式
+
+## 对每个 Agent 做并发隔离与失败熔断，避免单个 Agent 故障拖慢整轮协商
+
+### 
+
+### 熔断阈值是多少？一个 Agent 的请求阻塞了，会影响其他 Agent 的投递吗？
+
