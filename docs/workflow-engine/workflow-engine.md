@@ -241,6 +241,8 @@ private void executeLayer(WorkflowDefinition def, WorkflowRun run,
 }
 ```
 
+这里提交的任务是 "节点的执行编排（抢信号量 + 调用 + 释放）" 而不是节点业务本身。
+
 涉及到的并发模型
 
 1.信号量——Semaphore
@@ -257,7 +259,19 @@ private void executeLayer(WorkflowDefinition def, WorkflowRun run,
 
 4.超时取消
 
-`futures.forEach(f -> f.cancel(true))`
+`futures.forEach(f -> f.cancel(true))`，这个取消几乎没什么用。
+
+那 CompletableFuture.cancel() 有什么用：
+
+如果线程池用的是有界队列（比如 `LinkedBlockingQueue`），任务提交后在队列里等着，还没被 worker 取走。这时 cancel 它，worker 取出来时会发现 future 已 cancelled，不再执行。但是在这段代码里用的是 `SynchronousQueue`，任务提交就立即开始跑，不存在 "在队列里等" 的状态。等全局超时触发、代码走到 `futures.forEach(f -> f.cancel(true))` 时，所有任务都已经在线程上跑着了，cancel 只能标记 future 状态，拦不到任何东西。
+
+那为什么不用 ExecutorService.submit()
+
+1.用 allOf 等所有节点，如果是 ExecutorService.submit() 拿到的是 List<Future>
+
+2.即使改成 submit+FutureTask，也 interrupt 不到真正跑节点业务的线程
+
+真正跑 LLM 调用、工具调用、HTTP 请求的代码在 nodeCallExecutor 线程上（cancel 能终止的 "还没交给 nodeCallExecutor" 的情况）
 
 ### 核心状态机——executeInternal
 
@@ -294,8 +308,7 @@ private WorkflowRun prepareResume(WorkflowDefinition definition, WorkflowRun run
         run.setDefinitionFingerprint(currentFingerprint);
     }
 
-    // 执行配置也必须一致。结构指纹只覆盖拓扑，改 prompt / 工具参数 / 超时 /
-    // 降级策略 / 节点顺序都不会被上面那道门发现；
+    // 执行配置也必须一致。结构指纹只覆盖拓扑，改 prompt / 工具参数 / 超时 / 降级策略 / 节点顺序都不会被上面那道门发现；
     // 旧快照没有这个字段（null），放行并就地升级，避免这次改动把存量快照一次性判死。
     String currentExecutionFingerprint = definition.executionFingerprint();
     String snapshotExecutionFingerprint = run.getExecutionFingerprint();
@@ -369,6 +382,22 @@ private WorkflowRun prepareResume(WorkflowDefinition definition, WorkflowRun run
     return run;
 }
 ```
+
+恢复的校验：工作流本身不为空且DAG合法，两个指纹校验（结构指纹、配置校验），状态是否可恢复。
+
+如果不校验会出什么问题：
+
+1.
+
+并发检查是不是已经有恢复开始跑了：检查"同 JVM 二次调用"和"多副本执行"
+
+清理中断残留：
+
+ // 清理中断残留：崩溃时 activeNodeIds 里的节点并未完成，需重跑；
+    // failedNodeIds 同理清空，否则重跑成功后失败记录仍在，状态自相矛盾。
+    // blockedNodeIds 与 failedNodeIds 同去同留 —— 它记的是「上游断了所以没跑」，失败节点要重跑，下游就该解冻。
+    // 不清的后果：上游重跑成功了，下游却永远不跑，而且连日志都没有
+    // skippedNodeIds 刻意保留 —— 和 completedNodeIds 一样，跳过是「已经定下来的结论」
 
 ### 节点调度判断——shouldExecuteNode
 
