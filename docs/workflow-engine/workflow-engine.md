@@ -383,21 +383,27 @@ private WorkflowRun prepareResume(WorkflowDefinition definition, WorkflowRun run
 }
 ```
 
-恢复的校验：工作流本身不为空且DAG合法，两个指纹校验（结构指纹、配置校验），状态是否可恢复。
+恢复前校验：工作流本身不为空且 DAG 合法，两个指纹校验（结构指纹、配置校验），状态是否可恢复。
 
 如果不校验会出什么问题：
 
-1.
+1.产生副作用
+
+2.
+
+3.
 
 并发检查是不是已经有恢复开始跑了：检查"同 JVM 二次调用"和"多副本执行"
 
 清理中断残留：
 
- // 清理中断残留：崩溃时 activeNodeIds 里的节点并未完成，需重跑；
-    // failedNodeIds 同理清空，否则重跑成功后失败记录仍在，状态自相矛盾。
-    // blockedNodeIds 与 failedNodeIds 同去同留 —— 它记的是「上游断了所以没跑」，失败节点要重跑，下游就该解冻。
-    // 不清的后果：上游重跑成功了，下游却永远不跑，而且连日志都没有
-    // skippedNodeIds 刻意保留 —— 和 completedNodeIds 一样，跳过是「已经定下来的结论」
+崩溃时 activeNodeIds 里的节点并未完成，需重跑；failedNodeIds 同理清空，否则重跑成功后失败记录仍在，状态自相矛盾。blockedNodeIds 与 failedNodeIds 同去同留 —— 它记的是「上游断了所以没跑」，失败节点要重跑，下游就该解冻。skippedNodeIds 刻意保留 —— 和 completedNodeIds 一样，跳过是「已经定下来的结论」
+
+不清的后果：
+
+上游重跑成功了，下游却永远不跑，而且连日志都没有
+
+占用 "本 JVM 正在跑它" 的槽位
 
 ### 节点调度判断——shouldExecuteNode
 
