@@ -275,9 +275,15 @@ flowchart TD
     class V,Split decision
 ```
 
-### 为什么不直接给每个 Agent 一个独立会话？
-
 ### "各 Agent 唤醒互不打扰"——具体指什么？两个 Agent 同时给同一个 Agent 发消息，它会怎么处理？
+
+不同会话、不同 messageId 的 REQUEST，各走各的执行通道，不互相阻塞、不共享上下文。
+
+两个 Agent 同时给 B 发消息。B 收到两个 wake，`dispatch` 被调两次，由于 `markHandled` 的键是 `messageId`，msg1 和 msg2 是不同 UUID，两个都能抢到，不互相排队。线程并行跑，两次 `runAgent` 是两个独立的 HTTP 调用，B 的 Agent 服务端各自创建独立的 ReAct 上下文 —— 各自有自己的步数预算、工具调用历史、Final Answer。
+
+互不打扰具体指：
+
+1.执行权不互抢，2.推理上下文不共享，3.结果回投不串
 
 ### seq 是怎么分配的？为什么用 Redis 的原子计数器，不用数据库自增或者 UUID？
 
@@ -303,25 +309,11 @@ seq 的本质是会话内的单调递增游标，不是全局唯一 ID。数据�
 
 ### 序号中间断了一个怎么办？比如 seq=3 写失败了，消费方拉到 seq=1,2,4 会怎么处理？
 
-
+seq 加一成功但是 append 失败，序号被消耗了但是消息没写进去，会先回滚，回滚失败才会出现序号中断了一个的情况（但是 append 失败就失败了，因为这段时间 Redis 都在抖动，干脆直接失败），不会有问题，既不会产生重读也不会漏
 
 ### 做了消息幂等，那重复消息是怎么来的？为什么会重复？
 
-重复消息来源：
-
-1.网络重试：响应丢了，发送方以为没发出去。
-
-发送方 → Gateway：POST /messages（REQUEST）
-
-Gateway → 发送方：200 OK（但响应在网络里丢了）
-
-发送方超时，没收到 200，重试：再发一条一模一样的 REQUEST
-
-如果消息是 REPLY(带 replyTo) ：
-
-2.wake 重投：消息落盘了，但对方没 "收到通知"
-
-
+你发了一个网络请求，你永远不知道对方是没收到、还是收到了但响应没回来。 重试是兜底，但重试就可能导致对方收到两次。两道幂等闸就是为了让 "收到两次" 只执行一次、只写一次。
 
 ### 幂等靠什么判重？去重键是什么？键的粒度怎么定的？
 
@@ -330,7 +322,7 @@ Gateway → 发送方：200 OK（但响应在网络里丢了）
 1.claimReply(回复去重)——四段键 `a2a:replied:{sessionId}:{fromAgentId}:{replyTo}:{payload摘要}
 `
 
-sessionId：不同会话互不影响
+sessionId：不同会话
 
 fromAgentId：同一个 Agent 对同一个请求的回复才算重复
 
@@ -339,7 +331,7 @@ replyTo：回复的是哪条请求
 payload 摘要：同一个 Agent 对同一个请求改口
 
 2.markHandled(执行去重)——单键 `a2a:handled:{messageId}
-`
+`，是在执行之前"抢锁"，成功了就继续执行
 
 ### 判重的那个存储挂了怎么办？Redis 不可用的时候，是放行还是拒绝？
 
@@ -349,14 +341,11 @@ claimReply——计数留痕，本次放行，不做去重
 
 Agent 跑完了 ReAct 循环、生成了回复、提交 REPLY 到 Gateway——这时候 Agent 已经跑完了，回复已经生成了。重复提交只是 "同一份结果被 post 了两次"，不会多跑一次 Agent、不会多烧一次 token。重复的代价是：消息日志里多了一条内容几乎一样的 REPLY，messageId 不同、seq 不同。
 
-消费端是怎么处理重复的 REPLY 的：读的过程中判断 `isReplyTo(message, messageId)`，如果消息回复的是我的 messageId 直接返回不再继续读了，因此这个重复对消费端没有影响
+消费端是怎么处理重复的 REPLY 的：读的过程中判断 `isReplyTo(message, messageId)`，如果消息回复的是我的 messageId 就直接返回不再继续读了，因此这个重复对消费端没有影响
 
-那万一有多条有用的消息呢
+那万一有多条不同的消息 replyTo 都是当前 messageId 呢，不就漏了吗——有执行层幂等闸、写入层去重闸，理论上不会出现假设的这种情况
 
-
-markHandled——"拿不到闸门就不干活"会让一次 Redis 抖动变成一堆永远不执行的委派
-
-
+markHandled——"拿不到闸门就不干活"会让一次 Redis 抖动变成一堆永远不执行的委派（所有正在派发的 REQUEST 都 markHandled 失败，所有正在轮询等 REPLY 的发起方都同时超时），并且旧的 REQUEST 不会再被唤醒
 
 ### 幂等存多久？为什么是这个时长？
 
@@ -374,4 +363,6 @@ TTL 必须大于一次执行的最长耗时：如果 TTL 太短，Agent 还在�
 
 ### 委派 Agent 怎么等待委派结果
 
-A 给 B 发了任务，A 不是一直盯着，而是每个 500ms readAfter 一次："会话里有没有新消息"，期间维护一个数避免每次都从头开始读，遇到期待的消息就返回
+A 给 B 发了任务，A 不是一直盯着，而是每个 500ms readAfter 一次："会话里有没有新消息"，期间维护一个数避免每次都从头开始读，遇到期待的消息就返回（replyTo 就是我发的那条 REQUEST 的 messageId）
+
+之所以不采用回调是因为开发时不能互相 import 对方的类
