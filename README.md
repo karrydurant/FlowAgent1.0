@@ -115,3 +115,5 @@ http://localhost:8081/swagger-ui.html
 ## [Agent 注册与能力发现](docs/agent-registry/agent-registry.md)
 
 ## [链路追踪与成本监控](docs/trace/trace.md)
+
+## [当前项目的问题](docs/imperfection/imperfection.md)
