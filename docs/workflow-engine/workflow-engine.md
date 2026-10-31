@@ -153,7 +153,7 @@ private void executeNodeWithRetries(WorkflowDefinition def, WorkflowRun run,
 
 在处理中断异常的时候 `Thread.currentThread().interrupt();` 重新标记了一次中断，这是因为 `Thread.sleep()` 被中断时，会抛出 `InterruptedException`，但同时会把中断标志清掉，外层可能还需要知道 "这个线程被中断过"。如果不恢复，中断信号就丢了 —— 上层以为一切正常，继续往下跑。
 
-为什么等待结果期间会被中断：上层 executeLayer 中有 `futures.forEach(f -> f.cancel(true));` 中断节点执行
+为什么等待结果期间会被中断：
 
 中断信号就丢了 —— 上层以为一切正常，继续往下跑，这会产生什么后果，有没有具体例子：
 
