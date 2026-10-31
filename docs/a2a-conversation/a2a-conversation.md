@@ -147,6 +147,8 @@ private A2aSession persist(String sessionId, A2aMessage message) {
 }
 ```
 
+首先确认消息体、发送方不能为空，且发送方必须在会话成员里
+
 备注：**Redis 是跨进程的，它存不了 Java 对象**
 
 ## 会话存储——SessionStore
@@ -156,3 +158,105 @@ private A2aSession persist(String sessionId, A2aMessage message) {
 ## 对端分发器——PeerDispatcher
 
 ## 委派管理——DelegationManager
+
+## 设计细节
+
+### "共同会话 + 单独收件箱" 具体指的是什么？
+
+共同会话=共享一份消息日志
+
+一个会话在 Redis 里是三个 key：
+
+a2a:session:{sessionId}    ← 元数据（成员表、状态、topic）
+
+a2a:msgs:{sessionId}       ← 消息日志（所有消息按 seq 排的 List）
+
+a2a:seq:{sessionId}        ← 序号计数器
+
+"共同" 的意思是：这个会话里所有成员发的每一条消息（REQUEST、REPLY、PROPOSE、INFORM…），都 append 到同一个 a2a:msgs:{sessionId} 列表里，按 seq 递增排序。任何成员都能调 GET /a2a/sessions/{id}/messages?after=N 读到这份日志，不管是发给谁的。
+
+单独收件箱 = 每个 Agent 自己的待办队列
+
+每个 Agent 在 Redis 里还有一个自己的队列：
+
+a2a:inbox:{agentId}        ← RQueue，里面放的是 "sessionId:seq" 指针
+
+"单独" 的意思是：消息落盘后，`SessionManager.deliver` 会判断这条消息的接收方是谁，往那个 Agent 的 inbox 里放一条指针 `sessionId:seq`。
+
+Agent 在跑自己的 ReAct 循环时，每轮开头做一件事：从自己的 inbox 里 poll 出指针，按 `sessionId:seq` 去共享消息日志里把这条消息捞出来，注入到本轮上下文里。
+
+两层的分工是：会话日志管 "消息的持久化和共享历史"，收件箱管 "谁该被唤醒"。消息本体只写一份（会话日志），收件箱里只是指针
+
+### 消息从发出到被另一个 Agent 收到，走了哪几步？
+
+
+
+### 为什么不直接给每个 Agent 一个独立会话？
+
+### "各 Agent 唤醒互不打扰"——具体指什么？两个 Agent 同时给同一个 Agent 发消息，它会怎么处理？
+
+### seq 是怎么分配的？为什么用 Redis 的原子计数器，不用数据库自增或者 UUID？
+
+```java
+// 没有直接使用 INCR，因为要做消息预算。
+// 如果直接 INCR，N 个并发请求同时读到 current=budget-1，全部判定 "还没到预算"，各自 INCR—— 预算被击穿。
+for (int attempt = 0; attempt < 64; attempt++) {
+    long current = counter.get();
+    if (current >= budget) return -1;      // 超预算
+    if (counter.compareAndSet(current, current + 1)) {
+        counter.expire(ttl());
+        return current + 1;
+    }
+}
+
+// 写消息日志失败要回滚
+// 不是直接 DECR—— 因为并发下别的消息可能已经在这个值之后又占了号
+// 如果发现别人已经占了号(CAS失败了)，就放弃回收，回收失败的号就对应一个空消息
+counter.compareAndSet(seq, seq - 1);
+```
+
+seq 的本质是会话内的单调递增游标，不是全局唯一 ID。数据库自增太重；UUID 无序、做不了增量拉取。选 RAtomicLong 是因为它正好匹配 "会话内单调递增 + 增量游标 + 消息预算" 这三个需求，没有额外存储成本。
+
+### 序号中间断了一个怎么办？比如 seq=3 写失败了，消费方拉到 seq=1,2,4 会怎么处理？
+
+
+
+### 做了消息幂等，那重复消息是怎么来的？为什么会重复？
+
+重复消息来源：
+
+1.网络重试：响应丢了，发送方以为没发出去。
+
+发送方 → Gateway：POST /messages（REQUEST）
+
+Gateway → 发送方：200 OK（但响应在网络里丢了）
+
+发送方超时，没收到 200，重试：再发一条一模一样的 REQUEST
+
+如果消息是 REPLY(带 replyTo) ：
+
+2.wake 重投：消息落盘了，但对方没 "收到通知"
+
+
+
+### 幂等靠什么判重？去重键是什么？键的粒度怎么定的？
+
+两层去重，键得粒度不同：
+
+1.claimReply(回复去重)——四段键 `a2a:replied:{sessionId}:{fromAgentId}:{replyTo}:{payload摘要}
+`
+
+sessionId：不同会话互不影响
+
+fromAgentId：同一个 Agent 对同一个请求的回复才算重复
+
+replyTo：回复的是哪条请求
+
+payload 摘要：同一个 Agent 对同一个请求改口
+
+2.markHandled(执行去重)——单键 `a2a:handled:{messageId}
+`
+
+### 判重的那个存储挂了怎么办？Redis 不可用的时候，是放行还是拒绝？
+
+### 幂等存多久？为什么是这个时长？
