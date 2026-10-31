@@ -259,4 +259,23 @@ payload 摘要：同一个 Agent 对同一个请求改口
 
 ### 判重的那个存储挂了怎么办？Redis 不可用的时候，是放行还是拒绝？
 
+claimReply 和 markHandled 两层都是 fail-open：
+
+claimReply——计数留痕，本次放行不做去重（这里重复的代价不是多烧 token，而是消息日志里多了一条内容几乎一样的 REPLY，messageId 不同、seq 不同）
+
+markHandled——"拿不到闸门就不干活"会让一次 Redis 抖动变成一堆永远不执行的委派（重复的代价是多跑一次 Agent）
+
 ### 幂等存多久？为什么是这个时长？
+
+claimReply：与会话同生命周期
+
+回复去重的目的是防 "同一个请求被重复回复"。会话结束后这个请求就没人再回了，去重槽跟着会话一起过期。
+
+markHandled：600s
+
+执行去重的目的是防 "同一条 REQUEST 被执行两次"。一次 Agent 执行的最长时间就是 `dispatchTimeoutSeconds`。
+
+TTL 必须大于一次执行的最长耗时：如果 TTL 太短，Agent 还在跑，键就过期了，重投过来会重新执行一遍。10 分钟是 "一次执行 + 可能的重投窗口" 的上界。
+
+为什么不存更长时间：防止 Redis 里堆积大量 `a2a:handled:{messageId}` 键，浪费内存
+
