@@ -207,9 +207,7 @@ a2a:seq:{sessionId}        ← 序号计数器
 
 "共同" 的意思是：这个会话里所有成员发的每一条消息（REQUEST、REPLY、PROPOSE、INFORM…），都 append 到同一个 a2a:msgs:{sessionId} 列表里，按 seq 递增排序。任何成员都能调 GET /a2a/sessions/{id}/messages?after=N 读到这份日志，不管是发给谁的。
 
-单独收件箱 = 每个 Agent 有自己的待办队列
-
-每个 Agent 在 Redis 里还有一个自己的队列：
+收件箱 = Agent 的 "未读通知栏"
 
 a2a:inbox:{agentId}        ← RQueue，里面放的是 "sessionId:seq" 指针
 
@@ -217,11 +215,11 @@ a2a:inbox:{agentId}        ← RQueue，里面放的是 "sessionId:seq" 指针
 
 Agent 在跑自己的 ReAct 循环时，每轮开头做一件事：从自己的 inbox 里 poll 出指针，按 `sessionId:seq` 去共享消息日志里把这条消息捞出来，注入到本轮上下文里。
 
-两层的分工是：会话日志管 "消息的持久化和共享历史"，收件箱管 "谁该被唤醒"。消息本体只写一份（会话日志），收件箱里只是指针
+两层的分工是：会话日志管 "消息的持久化和共享历史"，收件箱管 "每个 Agent 各自的消息"。消息本体只写一份（会话日志），收件箱里只是指针
 
 ### 收件箱里为什么只存储 INFORM/PROPOSE/VOTE，REQUEST、REPLY、SOLICIT 都不在里面
 
-首先要明白收件箱的作用：多 Agent 协作时，一个 Agent 正在跑自己的推理循环，这时候别人给它发了消息 —— 如果直接打断它，它正在做的事就乱了；如果完全不管，消息又永远没人看。收件箱就是Agent 的 "未读消息通知栏"—— 别人发的通知先放在这里，Agent 每轮推理开头看一眼，拼进上下文里自己决定要不要回应。它不打断当前工作、不保证一定被处理，但保证消息不丢。
+首先要明白收件箱的作用：多 Agent 协作时，一个 Agent 正在跑自己的推理循环，这时候别人给它发了消息 —— 如果直接打断它，它正在做的事就乱了；如果完全不管，消息又永远没人看。收件箱就是Agent 的 "未读消息通知栏"—— 别人发的通知先放在这里，Agent 每轮推理开头看一眼，拼进上下文里自己决定要不要回应（对话是通过新委派完成的，如果没有注册对应 Agent 为当前 Agent 的工具就不可能回应）。它不打断当前工作、不保证一定被处理，但保证消息不丢。
 
 之所以不放 REQUEST、REPLY、SOLICIT 是因为:
 
@@ -229,7 +227,53 @@ REQUEST 是委派执行，是一定要执行的；SOLICIT 是征求意见，也�
 
 ### 消息从发出到被另一个 Agent 收到，走了哪几步？
 
-### 等待 REPLY
+```mermaid
+flowchart TD
+    Start([发起方<br/>PeerAgentToolBridge / DelegationManager / REST]) --> Post["POST /a2a/sessions/id/messages"]
+
+    subgraph SM["SessionManager.post"]
+        Post --> V{"校验<br/>会话OPEN? 成员? 自环?<br/>回复归属?"}
+        V -->|失败| Reject([抛异常])
+        V -->|通过| D1["写入层去重闸<br/>trySet replied:key"]
+        D1 --> Seq["CAS 预占序号<br/>RAtomicLong INCR"]
+        Seq --> Log["append 消息 JSON<br/>到会话日志 RList"]
+    end
+
+    Log --> Split{"按接收方投递"}
+
+    subgraph WakePath["REQUEST / SOLICIT — 立即唤醒"]
+        Split -->|本实例| Local["PeerDispatcher.dispatch<br/>(进程内直调)"]
+        Split -->|远端| Wake["POST /wake<br/>只带 messageId"]
+        Wake --> Remote["远端 PeerDispatcher.dispatch"]
+    end
+
+    subgraph InboxPath["INFORM / PROPOSE / VOTE — 进收件箱"]
+        Split --> Push["pushInbox<br/>RPUSH 指针 sessionId:seq"]
+    end
+
+    Local --> Mark["markHandled<br/>trySet handled:messageId=RUNNING"]
+    Remote --> Mark
+    Mark --> Pool["提交线程池<br/>core=2 max=8 queue=200"]
+    Pool --> Run["POST /agents/target/run<br/>query=task, context=..."]
+
+    subgraph ReAct["接收方 ReActAgent 推理循环"]
+        Run --> Round["每轮开头"]
+        Round --> Drain["inbox.drain<br/>LPOP 收件箱指针"]
+        Drain --> Resolve["按指针 resolve 消息<br/>渲染成 [A2A 消息] 文本"]
+        Resolve --> Obs["注入为 Observation<br/>action=(收件箱)"]
+        Obs --> Think["模型 Thought<br/>决定下一步 Action"]
+    end
+
+    Push -.->|对方下次自己推理时| Drain
+
+    Think -->|输出 finalAnswer| Reply["PeerDispatcher 回投<br/>POST /messages<br/>kind=REPLY/PROPOSE<br/>replyTo=原messageId"]
+    Reply -.->|闭环| Post
+
+    classDef store fill:#e8f4fd,stroke:#4a90d9
+    classDef decision fill:#fff4e0,stroke:#e0a04a
+    class Log,Drain,Push store
+    class V,Split decision
+```
 
 ### 为什么不直接给每个 Agent 一个独立会话？
 
