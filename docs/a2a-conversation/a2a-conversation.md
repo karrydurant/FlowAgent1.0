@@ -1,5 +1,18 @@
 # 多 Agent 会话与消息传输
 
+## 消息类型
+
+| kind | 发送方 | 消息体格式 | 是否要求执行 | 是否进收件箱 | 是否走回复去重 |
+|---|---|---|---|---|---|
+| REQUEST | 委派方 | `{task, depth?}` 要对方做的事 | ✓ 跑 Agent | ✗ | ✗ |
+| REPLY | 被委派方 | `{success, answer}` 或 `{success:false, error}`，须带 replyTo | ✗ | ✓ | ✓ |
+| SOLICIT | 协商召集人 | `{task, round, prior?}` 征询本轮意见 | ✓ 跑 Agent | ✗ | ✗ |
+| PROPOSE | 协商参与者 | `{decision, confidence, reason}`，须带 replyTo | ✗ | ✓ | ✓ |
+| VOTE | 协商参与者 | `{vote}` 对方案表态 | ✗ | ✓ | ✓ |
+| INFORM | 任何成员 | 自由结构，纯告知不等回复 | ✗ | ✓ | ✗ |
+
+协商召集人：它
+
 ## 会话管理器——SessionManager
 
 负责开会话、投递消息、读取、收尾
@@ -187,9 +200,17 @@ Agent 在跑自己的 ReAct 循环时，每轮开头做一件事：从自己的 
 
 两层的分工是：会话日志管 "消息的持久化和共享历史"，收件箱管 "谁该被唤醒"。消息本体只写一份（会话日志），收件箱里只是指针
 
+### 收件箱里为什么只存储 INFORM/PROPOSE/VOTE，REQUEST、REPLY、SOLICIT 都不在里面
+
+首先要明白收件箱的作用：多 Agent 协作时，一个 Agent 正在跑自己的推理循环，这时候别人给它发了消息 —— 如果直接打断它，它正在做的事就乱了；如果完全不管，消息又永远没人看。收件箱就是Agent 的 "未读消息通知栏"—— 别人发的通知先放在这里，Agent 每轮推理开头看一眼，拼进上下文里自己决定要不要回应。它不打断当前工作、不保证一定被处理，但保证消息不丢。
+
+之所以不放 REQUEST、REPLY、SOLICIT 是因为:
+
+REQUEST 是委派执行，是一定要执行的；SOLICIT 是征求意见，也是必须要回复的。REPLY 的消费方不是 Agent 的推理循环（收件箱是给 Agent 的 ReAct 循环用的，每轮推理前拼进上下文），是发 REQUEST 的 Agent 在轮询，它是从会话日志里 readAfter 拉取的，而不是靠收件箱
+
 ### 消息从发出到被另一个 Agent 收到，走了哪几步？
 
-
+### 等待 REPLY
 
 ### 为什么不直接给每个 Agent 一个独立会话？
 
@@ -261,9 +282,18 @@ payload 摘要：同一个 Agent 对同一个请求改口
 
 claimReply 和 markHandled 两层都是 fail-open：
 
-claimReply——计数留痕，本次放行不做去重（这里重复的代价不是多烧 token，而是消息日志里多了一条内容几乎一样的 REPLY，messageId 不同、seq 不同）
+claimReply——计数留痕，本次放行，不做去重
 
-markHandled——"拿不到闸门就不干活"会让一次 Redis 抖动变成一堆永远不执行的委派（重复的代价是多跑一次 Agent）
+Agent 跑完了 ReAct 循环、生成了回复、提交 REPLY 到 Gateway——这时候 Agent 已经跑完了，回复已经生成了。重复提交只是 "同一份结果被 post 了两次"，不会多跑一次 Agent、不会多烧一次 token。重复的代价是：消息日志里多了一条内容几乎一样的 REPLY，messageId 不同、seq 不同。
+
+消费端是怎么处理重复的 REPLY 的：读的过程中判断 `isReplyTo(message, messageId)`，如果消息回复的是我的 messageId 直接返回不再继续读了，因此这个重复对消费端没有影响
+
+那万一有多条有用的消息呢
+
+
+markHandled——"拿不到闸门就不干活"会让一次 Redis 抖动变成一堆永远不执行的委派
+
+
 
 ### 幂等存多久？为什么是这个时长？
 
@@ -279,3 +309,6 @@ TTL 必须大于一次执行的最长耗时：如果 TTL 太短，Agent 还在�
 
 为什么不存更长时间：防止 Redis 里堆积大量 `a2a:handled:{messageId}` 键，浪费内存
 
+### 委派 Agent 怎么等待委派结果
+
+A 给 B 发了任务，A 不是一直盯着，而是每个 500ms readAfter 一次："会话里有没有新消息"，期间维护一个数避免每次都从头开始读，遇到期待的消息就返回
