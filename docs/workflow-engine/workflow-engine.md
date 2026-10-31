@@ -20,7 +20,7 @@
 private void executeNodeWithRetries(WorkflowDefinition def, WorkflowRun run,
                                     String nodeId, WorkflowNode node,
                                     Deadline deadline, NodeTrace trace) {
-    // 排队等信号量的节点可能在工作流已经超时 / 失败之后才轮到。
+    // 排队等信号量的节点可能在工作流已经进入终态之后才轮到。
     // 此时不要再开始执行，更不要执行完再提交结果
     if (isTerminal(run.getStatus())) {
         log.warn("[Executor] node not started: run already terminal | runId={} | node={} | status={}",
@@ -147,17 +147,27 @@ private void executeNodeWithRetries(WorkflowDefinition def, WorkflowRun run,
 }
 ```
 
-层内节点通过 Semaphore 控制并发，节点需要先 acquire 一个信号量才能开始执行，第一步先确认工作流是否超时，是否已经因为其它节点的失败确认为失败，如果是的话就不必继续执行。
+节点在同一层内由一个 Semaphore 控制并发，拿到许可才开始执行。拿到许可后先看一眼 run 是不是已经进入终态 —— 兄弟节点可能已经把整个工作流推到失败、完成或取消，这时候再启动就是白跑还产生副作用，直接返回。
 
-继续执行，将当前 nodeId 加入 activeNodeIds 集合。进入重试循环，每次循环开头也检查一遍 "工作流是否超时，是否已经因为其它节点的失败确认为失败"，没有就继续执行，使用 ExecutorService.submit 提交节点任务，在等待结果期间如果节点任务线程被中断的话先 future.cancel() 终止节点执行然后外层 catch 异常后再处理；如果是超时也是先 future.cancel() 取消节点执行，但是这是允许重试的，设置了最大重试次数。另外挂起也被视为异常，但是不会重试。
+确认能跑，就把 nodeId 登记到 activeNodeIds，进入重试循环。每次重试开头再查一次终态—— 因为第一次失败和第二次重试之间，兄弟节点可能已经出结果了。
 
-在处理中断异常的时候 `Thread.currentThread().interrupt();` 重新标记了一次中断，这是因为 `Thread.sleep()` 被中断时，会抛出 `InterruptedException`，但同时会把中断标志清掉，外层可能还需要知道 "这个线程被中断过"。如果不恢复，中断信号就丢了 —— 上层以为一切正常，继续往下跑。
+每次尝试把节点任务提交到独立的 nodeCallExecutor 线程池，用 Future 拿结果。这里有个关键选择：用 `ExecutorService.submit` 返回的 FutureTask，而不是 CompletableFuture。原因是 JDK 里 `CompletableFuture.cancel(true)` 不会真的中断正在跑的工作线程，只有 `FutureTask.cancel(true)` 会真发 interrupt—— 节点超时必须能硬止血。
 
-为什么等待结果期间会被中断：
+等待超时不是直接读节点配的 timeout，而是取它和工作流全局剩余预算的较小值 —— 否则一个配了 600 秒的节点能把全局预算 60 秒的工作流拖死 10 分钟。
 
-中断信号就丢了 —— 上层以为一切正常，继续往下跑，这会产生什么后果，有没有具体例子：
+等待过程中三种异常三种出口：
 
+1. 等待线程自己被中断（比如线程池 shutdownNow）：先 cancel 掉节点工作线程，再把异常抛到方法级 catch，那里用 `Thread.currentThread().interrupt()` 恢复中断位—— 因为 JDK 不管是 `Thread.sleep` 还是 `FutureTask.get` 抛中断时都会清掉中断标志，不恢复的话上层就感知不到关闭信号了。出现这个异常不重试，run 直接落失败。
+   
+2. 节点执行超时：cancel 工作线程，包成 NODE_TIMEOUT 走通用失败分支进重试；重试用尽后按节点配的降级策略处理。
+   
+3. 节点抛挂起异常（人工审批）：这个在通用 catch 里被特意挑出来直接重抛，不进重试 —— 否则重试会再建一个审批任务，一次挂起变成 N 个待审批。
 
+中断信号不恢复会产生什么后果：
+
+中断位是线程身上的一个开关。`interrupt()` 把它拨 ON，阻塞方法发现 ON 就抛异常并顺手拨回 OFF。catch 里手动 interrupt() 是把它重新拨回 ON。否则线程回到线程池会一直等下一个任务入队。在等待的过程中有两件事会唤醒它：1.有新元素入队，signal() 唤醒；2.在等待的线程被 interrupt，等待立即抛 InterruptedException，接下来会检查池的状态，池是 SHUTDOWN：队列里有任务就先把任务跑完再退出，池是 STOP：线程直接退出线程池。
+
+所以如果不做中断位的复位就会产生线程池已经关闭，线程还在的情况。优雅关闭时线程退不出来，只能等到强行 interrupt 才退出。
 
 ### 层间执行——executeLayer
 
