@@ -2,16 +2,35 @@
 
 ## 消息类型
 
-| kind | 发送方 | 消息体格式 | 是否要求执行 | 是否进收件箱 | 是否走回复去重 |
-|---|---|---|---|---|---|
-| REQUEST | 委派方 | `{task, depth?}` 要对方做的事 | ✓ 跑 Agent | ✗ | ✗ |
-| REPLY | 被委派方 | `{success, answer}` 或 `{success:false, error}`，须带 replyTo | ✗ | ✓ | ✓ |
-| SOLICIT | 协商召集人 | `{task, round, prior?}` 征询本轮意见 | ✓ 跑 Agent | ✗ | ✗ |
-| PROPOSE | 协商参与者 | `{decision, confidence, reason}`，须带 replyTo | ✗ | ✓ | ✓ |
-| VOTE | 协商参与者 | `{vote}` 对方案表态 | ✗ | ✓ | ✓ |
-| INFORM | 任何成员 | 自由结构，纯告知不等回复 | ✗ | ✓ | ✗ |
+**REQUEST**
 
-协商召集人：它
+由委派方发送，等一个执行结果，消息结构 `{task: "要做什么", depth: 委派链深度, context?: 业务上下文}`
+
+会让接收方真的跑一遍自己的 ReAct 循环
+
+**SOLICIT**
+
+由协商召集人发送，等一个看法，消息结构 `{task, round, prior?}`
+
+会让接收方真的跑一遍自己的 ReAct 循环
+
+**REPLY**
+
+被委派方的回复，消息体结构 `{agentId, success, answer, totalSteps, error}`
+
+**PROPOSE**
+
+由被征询方发送，和 REPLY 同结构，投票是从 answer 文本里二次解析出来的
+
+**INFORM**    
+
+任何成员都可以发送这类消息，自由结构
+
+**VOTE（协议里预留了 VOTE，但当前版本协商表态统一走 PROPOSE）**
+
+由协商参与者发送，对某个已提出的方案表态
+
+协商召集人：召集人是这个会话协议里的一个占位身份，不是注册在 Agent 注册中心里的真 Agent。之所以需要它是因为协议里有一条规矩：每条消息的发送方必须是会话成员。但协商的发起方是工作流节点（或会话台前的人），它本身不是 Agent—— 没有 agentId、不会跑 LLM。可它必须在会话里，因为它要发征询（SOLICIT）、要收答案（PROPOSE）。于是给它一个约定名字放进成员表，绕过 "查注册表" 那套准入。
 
 ## 会话管理器——SessionManager
 
@@ -188,7 +207,7 @@ a2a:seq:{sessionId}        ← 序号计数器
 
 "共同" 的意思是：这个会话里所有成员发的每一条消息（REQUEST、REPLY、PROPOSE、INFORM…），都 append 到同一个 a2a:msgs:{sessionId} 列表里，按 seq 递增排序。任何成员都能调 GET /a2a/sessions/{id}/messages?after=N 读到这份日志，不管是发给谁的。
 
-单独收件箱 = 每个 Agent 自己的待办队列
+单独收件箱 = 每个 Agent 有自己的待办队列
 
 每个 Agent 在 Redis 里还有一个自己的队列：
 
