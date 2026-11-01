@@ -185,7 +185,11 @@ private A2aSession persist(String sessionId, A2aMessage message) {
 
 ## 会话存储——SessionStore
 
+A2A 会话的 Redis 读写——会话元数据、消息日志、序号分配器
 
+```java
+
+```
 
 ## 对端分发器——PeerDispatcher
 
