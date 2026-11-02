@@ -449,11 +449,11 @@ private WorkflowRun prepareResume(WorkflowDefinition definition, WorkflowRun run
 
 如果不校验会出什么问题：
 
-1.产生副作用
+1.结构指纹——检查节点增删、连线变化，如果没有这道检查，前面按旧流程走，后面按新流程走。
 
-2.
+2.执行配置指纹——检查 prompt/工具/超时/重试 是否改变，防止新旧配置混跑
 
-3.
+3.状态可恢复——检查
 
 并发检查是不是已经有恢复开始跑了：检查"同 JVM 二次调用"和"多副本执行"
 
