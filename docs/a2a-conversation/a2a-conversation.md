@@ -187,9 +187,23 @@ private A2aSession persist(String sessionId, A2aMessage message) {
 
 A2A 会话的 Redis 读写——会话元数据、消息日志、序号分配器
 
+### 序号分配
+
+#### 追加——append
+
+追加一条消息：分配会话内序号并回填到 message，然后按投递顺序落盘。
+
 ```java
 
 ```
+
+#### 预占序号——reverseSeq
+
+#### 回滚失败的预占——rollbackSeq
+
+### 回复去重槽
+
+#### claimReply
 
 ## 对端分发器——PeerDispatcher
 
