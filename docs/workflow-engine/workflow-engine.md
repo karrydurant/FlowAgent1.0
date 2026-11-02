@@ -14,6 +14,68 @@
 
 将最终结果写入 WorkflowRun.output
 
+### 工作流定义——WorkflowDefinition
+
+工作流定义就是一个 JSON 对象，核心是 nodes + edges，表达成一张 DAG：
+
+```json
+{
+  "id": "wf-fault-diagnosis-001",
+  "name": "智能故障诊断工作流",
+  "version": "1.0.0",
+  "description": "当用户报告服务异常时，自动检索知识图谱、分析根因、生成诊断报告",
+  "triggerCondition": "用户报告服务故障或性能问题",
+
+  "nodes": [ ... ],   // 节点列表
+  "edges": [ ... ],   // 边列表（连接节点）
+
+  "config": { ... },  // 全局配置
+  "tags": ["fault-diagnosis", "sre", "demo"]
+}
+```
+
+#### 节点定义 JSON
+
+通用字段
+
+```json
+{
+  "id": "node-1",
+  "name": "理解用户报告",
+  "nodeType": "AGENT",          // 节点类型，决定用哪个执行器
+  "description": "解析用户报告的故障现象",
+  "timeoutSeconds": 90,          // 单次执行超时
+  "maxRetries": 1,               // 失败后重试次数（默认1）
+  "retryDelaySeconds": 2,        // 重试间隔
+  "fallbackStrategy": "SKIP"     // 降级策略：SKIP / FALLBACK_VALUE / PAUSE / FAIL
+}
+```
+
+各类型还有专属配置
+
+#### 边定义 JSON
+
+```json
+"edges": [
+  { "source": "node-1", "target": "node-2" },           // 无条件边
+  { "source": "node-2", "target": "node-3" },
+  { "source": "node-5", "target": "node-6", "condition": "approval_required" },  // 条件边
+  { "source": "node-5", "target": "node-7", "condition": "auto_fix" },           // 条件边
+  { "source": "node-6", "target": "node-7" }
+]
+```
+
+#### 全局配置
+
+```json
+"config": {
+  "globalTimeoutSeconds": 600,    // 整个工作流最多跑多久
+  "maxConcurrency": 10,           // 同层节点最大并行数
+  "checkpointEnabled": true,      // 是否开启断点续跑
+  "detailedTracing": true         // 是否开启全链路追踪
+}
+```
+
 ### 单节点执行——executeNodeWithRetries
 
 ```java
