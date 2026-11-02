@@ -193,6 +193,104 @@ A2A 会话的 Redis 读写——会话元数据、消息日志、序号分配器
 
 ## 对端分发器——PeerDispatcher
 
+### 异步派发执行——dispatch
+
+把一条消息交给后台处理，立即返回，不等执行完成,
+
+```java
+/**
+ * 把一条消息交给后台处理，立即返回，不等执行完成 —— 投递方（尤其是跨实例那条唤醒请求）不应该被对方的
+ * 推理耗时按在原地。
+ */
+public void dispatch(String sessionId, String messageId) {
+    // 幂等闸
+    // 这个幂等闸放在 pool.execute 之前而不是异步任务内
+    if (!markHandled(messageId)) {
+        log.info("[A2A] 这条消息已接手过，跳过重复派发 | session={} | message={}",
+                sessionId, messageId);
+        return;
+    }
+
+    try {
+        // FlowAgentContext.wrap(...) 把调用方的 ThreadLocal 上下文复制到后台线程
+        // TraceScope.start(...) 开一个 OpenTelemetry span，打 `session_id` / `message_id` 标签
+        pool.execute(FlowAgentContext.wrap(() -> {
+            Map<String, String> tags = new LinkedHashMap<>();
+            tags.put("flowagent.a2a.session_id", sessionId);
+            tags.put("flowagent.a2a.message_id", messageId);
+            try (TraceScope span = TraceScope.start("a2a.dispatch", tags)) {
+                boolean settled;
+                try {
+                    settled = handle(sessionId, messageId);
+                } catch (Exception e) {
+                    // catch 后台线程里的异常
+                    // 异常时 REPLY 大概率没投出去，所以 settled=false，允许重来
+                    log.error("[A2A] 处理消息失败 | session={} | message={} | error={}",
+                            sessionId, messageId, e.toString(), e);
+                    settled = false;
+                }
+                if (!settled) {
+                    retryableFailures.incrementAndGet();
+                }
+                if (settled) {
+                    markSettled(messageId, SUCCEEDED);
+                } else {
+                    markSettled(messageId, FAILED);
+                }
+                span.tag("flowagent.a2a.status", settled ? "success" : "failed");
+                if (metrics != null) {
+                    metrics.a2aMessage("dispatch", settled ? "success" : "failed");
+                }
+            }
+        }));
+    } catch (RejectedExecutionException e) {
+        // 拒绝就当没接手过：否则这条消息被永久标记为"已处理"，重投也会被闸门拦掉 —— 一次过载变成一个再也不会被执行的死消息。
+        releaseHandled(messageId);
+        throw FlowAgentException.of("DELIVER_FAILED",
+                "本实例的委派执行队列已满，暂时接不下新的委派（session="
+                        + sessionId + "）。消息已落盘，稍后可重新投递。", 503);
+    }
+}
+```
+
+### 抢占这条消息由我接手——markHandled
+
+```java
+private boolean markHandled(String messageId) {
+    if (messageId == null) {
+        // 没有 id 就没有去重的依据
+        // 放行而不是拦住：拦住等于把一条正常消息丢掉
+        return true;
+    }
+    try {
+        RBucket<String> guard = redissonClient.getBucket(
+                CacheConstants.A2A_SESSION_HANDLED + messageId);
+        // 第一步：用 trySet 而不是 get + set —— 那两步之间是竞态窗口，
+        // 值与 TTL 一次写入，不拆成 set + expire。
+        if (guard.trySet(RUNNING, handledTtlSeconds, TimeUnit.SECONDS)) {
+            return true;
+        }
+        // 第二步：上一次跑完但没送达的，允许重来
+        if (guard.compareAndSet(FAILED, RUNNING)) {
+            return true;
+        }
+        // 第三步：只接「键刚过期」这一种
+        return guard.trySet(RUNNING, handledTtlSeconds, TimeUnit.SECONDS);
+    } catch (Exception e) {
+        // Redis 不可用时不阻断执行
+        // 不能让一次 Redis 抖动变成一堆永远不执行的委派
+        // 放行留痕
+        long n = dedupeFailures.incrementAndGet();
+        if (n == 1 || n % 100 == 0) {
+            // 计数逐次，日志限流
+            log.warn("[A2A] 幂等闸读不到，本次放行不做去重 | 累计 {} 次 | message={} | error={}",
+                    n, messageId, e.toString());
+        }
+        return true;
+    }
+}
+```
+
 ## 委派管理——DelegationManager
 
 ## 设计细节
