@@ -194,7 +194,25 @@ A2A 会话的 Redis 读写——会话元数据、消息日志、序号分配器
 追加一条消息：分配会话内序号并回填到 message，然后按投递顺序落盘。
 
 ```java
+public long append(A2aMessage message) {
+    String sessionId = message.getSessionId();
+    long seq;
+    if (message.getSeq() > 0) {
+        // 调用方已经通过 reserveSeq 预占了序号。
+        seq = message.getSeq();
+        // 不能直接 set，会覆盖掉预占的 seq
+        ensureSeqAtLeast(sessionId, seq);
+    } else {
+        seq = nextSeq(sessionId);
+        message.setSeq(seq);
+    }
 
+    RList<String> list = redissonClient.getList(msgKey(sessionId));
+    list.add(JSON.toJSONString(message));
+    // 与元数据、计数器同刻续期，见类注释「三个 key 的 TTL 必须一起续」
+    list.expire(ttl());
+    return seq;
+}
 ```
 
 #### 预占序号——reverseSeq
@@ -401,6 +419,10 @@ flowchart TD
 
 1.执行权不互抢，2.推理上下文不共享，3.结果回投不串
 
+### seq 是什么数据结构？
+
+Redis 的一个 key `a2a:session:seq:a2a-session-abc` 存一个数字（每个会话 key 不一样）
+
 ### seq 是怎么分配的？为什么用 Redis 的原子计数器，不用数据库自增或者 UUID？
 
 ```java
@@ -462,6 +484,18 @@ Agent 跑完了 ReAct 循环、生成了回复、提交 REPLY 到 Gateway——�
 那万一有多条不同的消息 replyTo 都是当前 messageId 呢，不就漏了吗——有执行层幂等闸、写入层去重闸，理论上不会出现假设的这种情况
 
 markHandled——"拿不到闸门就不干活"会让一次 Redis 抖动变成一堆永远不执行的委派（所有正在派发的 REQUEST 都 markHandled 失败，所有正在轮询等 REPLY 的发起方都同时超时），并且旧的 REQUEST 不会再被唤醒
+
+### 为什么没有做 REQUEST 重试
+
+REQUEST 的发送方等不到 REPLY 就超时抛 504，没有做自动重试，因为跨进程 Agent 执行没有取消通道 —— 重试等于重跑一遍烧双份 token，而且发起方可能已经超时走了
+
+### 执行层幂等闸、写入层去重闸怎么实现的
+
+写入层幂等：Agent 跑完了，要把结果作为 REPLY 投回会话时，抢锁，抢到了就落盘，没抢到就返回已经有的那一条，key 是 `a2a:replied:{sessionId}:{fromAgentId}:{replyTo}:{payload的hash}
+`
+
+执行层幂等：就在 PeerDispatcher.dispatch() 里，key 是 `a2a:handled:{messageId}
+`，抢到了就执行，状态是 FAILED 允许重跑，状态是 RUNNING 不执行
 
 ### 幂等存多久？为什么是这个时长？
 
