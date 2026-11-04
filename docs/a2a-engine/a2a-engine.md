@@ -1,6 +1,6 @@
 # 多 Agent 协商引擎
 
-协商引擎解决的是：进程崩溃、副本切换、Agent 宕机、网络抖动、并发洪峰场景下，结果还是对的
+协商引擎：在进程崩溃、副本切换、Agent 宕机、网络抖动等故障场景下，通过状态落盘、幂等投递、崩溃自动接管与并发隔离，保证协商结果不重复、不丢失、不卡死。
 
 作用主要有：
 
@@ -617,6 +617,123 @@ private boolean inspect (String id) {
             return true;
         }
         return false;
+    }
+}
+```
+
+## 舱壁隔离与熔断——PeerCircuitBreaker
+
+舱壁隔离：把系统资源（线程池、数据库连接、HTTP 连接池、并发额度）按调用方分开隔离，每个调用方有自己的配额，一个慢调用方最多耗尽自己的配额，不会拖垮整个系统。
+
+熔断：当一个下游服务连续失败，就主动 "断开" 对它的调用
+
+```java
+public class PeerCircuitBreaker {
+    // 放行失败的原因
+    public enum Skip {
+        SKIPPED_BULKHEAD,
+        SKIPPED_CIRCUIT_OPEN
+    }
+
+    private final NegotiationProperties properties;
+
+    // 舱壁信号量
+    // key 是 agentId, value 是这个 Agent 的信号量
+    private final Map<String, Semaphore> permits = new ConcurrentHashMap<>();
+    // 熔断状态
+    //  key 是 agentId, value 是这个 Agent 的熔断器状态
+    private final Map<String, Health> health = new ConcurrentHashMap<>();
+
+    // 尝试放行一次投递
+    public Skip tryAcquire(String agentId) {
+        if (agentId == null) {
+            return null;
+        }
+        Health h=health.computeIfAbsent(agentId, ignored -> new Health());
+        long now = System.currentTimeMillis();
+        synchronized (h) {
+            // 判断熔断是否过期
+            if (h.openUntil > now) {
+                // 熔断打开的截止时间还没到，还在熔断中，直接拒绝
+                return Skip.SKIPPED_CIRCUIT_OPEN;
+            }
+            // 熔断是半开状态
+            if (h.openUntil != 0) {
+                // 有没有探针在飞
+                if (h.probeInFlight) {
+                    return Skip.SKIPPED_CIRCUIT_OPEN;
+                }
+                h.probeInFlight=true;
+            }
+        }
+        Semaphore semaphore=permits.computeIfAbsent(agentId, ignored -> new Semaphore(Math.max(1, properties.getPerPeerMaxInflight())));
+        if (!semaphore.tryAcquire()) {
+            synchronized (h) {
+                h.probeInFlight=false;
+            }
+            return Skip.SKIPPED_BULKHEAD;
+        }
+        return null;
+    }
+
+    // 投递结束
+    public void release(String agentId) {
+        if (agentId==null) {
+            return;
+        }
+        Semaphore semaphore = permits.get(agentId);
+        if (semaphore != null) {
+            semaphore.release();
+        }
+    }
+
+    public void onSettled(String agentId) {
+        if (agentId == null) {
+            return;
+        }
+        Health h=health.get(agentId);
+        if (h == null) {
+            return;
+        }
+        synchronized (h) {
+            h.probeInFlight = false;
+        }
+    }
+
+    // 一次成功的投递/执行：清零失败计数并关闭熔断
+    public void onSuccess(String agentId) {
+        if (agentId == null) {
+            return;
+        }
+        Health h=health.computeIfAbsent(agentId, ignored -> new Health());
+        synchronized (h) {
+            h.failure=0;
+            h.openUntil = 0;
+            h.probeInFlight = false;
+        }
+    }
+
+    // 一次失败的投递/执行
+    public void onFailure(String agentId) {
+        if (agentId == null) {
+            return;
+        }
+        Health h=health.computeIfAbsent(agentId, ignored -> new Health());
+        long now=System.currentTimeMillis();
+        synchronized (h) {
+            boolean probing=h.probeInFlight;
+            h.probeInFlight = false;
+            if (probing) {
+                h.failures=0;
+                h.openUntil=now+Math.max(1L, properties.getCircuitOpenMs());
+                return;
+            }
+            h.failures++;
+            if (h.failures >= Math.max(1, properties.getCircuitFailureThreshold())) {
+                h.failures = 0;
+                h.openUntil = now + Math.max(1L, properties.getCircuitOpenMs());
+            }
+        }
     }
 }
 ```
