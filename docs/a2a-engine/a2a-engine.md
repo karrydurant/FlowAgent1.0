@@ -627,113 +627,147 @@ private boolean inspect (String id) {
 
 熔断：当一个下游服务连续失败，就主动 "断开" 对它的调用
 
+### 放行决策
+
 ```java
-public class PeerCircuitBreaker {
-    // 放行失败的原因
-    public enum Skip {
-        SKIPPED_BULKHEAD,
-        SKIPPED_CIRCUIT_OPEN
-    }
-
-    private final NegotiationProperties properties;
-
-    // 舱壁信号量
-    // key 是 agentId, value 是这个 Agent 的信号量
-    private final Map<String, Semaphore> permits = new ConcurrentHashMap<>();
-    // 熔断状态
-    //  key 是 agentId, value 是这个 Agent 的熔断器状态
-    private final Map<String, Health> health = new ConcurrentHashMap<>();
-
-    // 尝试放行一次投递
-    public Skip tryAcquire(String agentId) {
-        if (agentId == null) {
-            return null;
-        }
-        Health h=health.computeIfAbsent(agentId, ignored -> new Health());
-        long now = System.currentTimeMillis();
-        synchronized (h) {
-            // 判断熔断是否过期
-            if (h.openUntil > now) {
-                // 熔断打开的截止时间还没到，还在熔断中，直接拒绝
-                return Skip.SKIPPED_CIRCUIT_OPEN;
-            }
-            // 熔断是半开状态
-            if (h.openUntil != 0) {
-                // 有没有探针在飞
-                if (h.probeInFlight) {
-                    return Skip.SKIPPED_CIRCUIT_OPEN;
-                }
-                h.probeInFlight=true;
-            }
-        }
-        Semaphore semaphore=permits.computeIfAbsent(agentId, ignored -> new Semaphore(Math.max(1, properties.getPerPeerMaxInflight())));
-        if (!semaphore.tryAcquire()) {
-            synchronized (h) {
-                h.probeInFlight=false;
-            }
-            return Skip.SKIPPED_BULKHEAD;
-        }
+public Skip tryAcquire(String agentId) {
+    if (agentId == null) {
         return null;
     }
 
-    // 投递结束
-    public void release(String agentId) {
-        if (agentId==null) {
-            return;
-        }
-        Semaphore semaphore = permits.get(agentId);
-        if (semaphore != null) {
-            semaphore.release();
-        }
-    }
+    Health h=health.computeIfAbsent(agentId, ignored -> new Health());
+    long now=System.currentTimeMillis();
 
-    public void onSettled(String agentId) {
-        if (agentId == null) {
-            return;
+    // 在 Health 锁内判断熔断状态，决定放不放探针
+    synchronized (h) {
+        // 熔断正在打开中，拒绝一切
+        if (h.openUntil > now) {
+            return Skip.SKIPPED_CIRCUIT_OPEN;
         }
-        Health h=health.get(agentId);
-        if (h == null) {
-            return;
-        }
-        synchronized (h) {
-            h.probeInFlight = false;
-        }
-    }
 
-    // 一次成功的投递/执行：清零失败计数并关闭熔断
-    public void onSuccess(String agentId) {
-        if (agentId == null) {
-            return;
-        }
-        Health h=health.computeIfAbsent(agentId, ignored -> new Health());
-        synchronized (h) {
-            h.failure=0;
-            h.openUntil = 0;
-            h.probeInFlight = false;
-        }
-    }
-
-    // 一次失败的投递/执行
-    public void onFailure(String agentId) {
-        if (agentId == null) {
-            return;
-        }
-        Health h=health.computeIfAbsent(agentId, ignored -> new Health());
-        long now=System.currentTimeMillis();
-        synchronized (h) {
-            boolean probing=h.probeInFlight;
-            h.probeInFlight = false;
-            if (probing) {
-                h.failures=0;
-                h.openUntil=now+Math.max(1L, properties.getCircuitOpenMs());
-                return;
+        // 半开状态
+        // 熔断窗口刚过，要放一个探针试试上游恢复了没有
+        if (h.openUntil != 0) {
+            // 已经有一个探针在飞了，其余请求继续拒绝
+            if (h.probeInFlight) {
+                return Skip.SKIPPED_CIRCUIT_OPEN;
             }
-            h.failures++;
-            if (h.failures >= Math.max(1, properties.getCircuitFailureThreshold())) {
-                h.failures = 0;
-                h.openUntil = now + Math.max(1L, properties.getCircuitOpenMs());
-            }
+            // 占住探针位：接下来要去 acquire 舱壁许可，acquire 成功才算探针真的飞出去
+            h.probeInFlight = true;
         }
+    }
+
+    // 拿舱壁信号量
+    Semaphore semaphore=permits.computeIfAbsent(agentId, ignored -> new Semaphore(Math.max(1, properties.getPerPeerMaxInflight())));
+
+    // tryAcquire 非阻塞：拿不到就立刻返回，不等待
+    if (!semaphore.tryAcquire()) {
+        // 舱壁满了
+        // 如果刚才在半开状态占了探针位，但现在舱壁没拿到 → 探针根本没飞出去，必须把探针位还回去
+        // 否则这个 peer 会永远卡在半开状态
+        synchronized (h) {
+            h.probeInFlight = false;
+        }
+        return Skip.SKIPPED_BULKHEAD;
+    }
+    return null;
+}
+```
+
+### 资源归还
+
+```java
+// 投递结束后归还舱壁许可
+// 无论成功失败，舱壁许可都要归还
+public void release(String agentId) {
+    if (agentId == null) {
+        return;
+    }
+    Semaphore semaphore = permits.get(agentId);
+    // 如果 semaphore 不存在（比如刚 reset 过），不做任何事，避免 NPE
+    if (semaphore != null) {
+        semaphore.release();
+    }
+}
+```
+
+### 结局回调
+
+#### 一次成功的投递/执行：清零失败计数并关闭熔断。
+
+成功指的是：消息已经成功写入共享 Redis，对方也收到了唤醒通知，整个投递链路是通的。
+
+熔断是为了处理 "持续故障"，不是 "偶发抖动"，所以一次成功就关闭熔断
+
+```java
+public void onSuccess(String agentId) {
+    if (agentId == null) {
+        return;
+    }
+    Health h = health.computeIfAbsent(agentId, ignored -> new Health());
+    synchronized (h) {
+        h.failures = 0;            
+        h.openUntil = 0;           
+        h.probeInFlight = false;   
+    }
+}
+```
+
+#### 一次失败的投递执行
+
+投递动作执行了，但没成功把消息送到对方手里，可能是因为：消息根本没写进共享 Redis，消息写进 Redis 了，但跨实例的 HTTP 唤醒通知没发出去
+
+1.半开状态下的探针失败 → 直接重新打开熔断，不再攒阈值
+
+2.闭合状态下的正常失败 → failures++，达到阈值才打开熔断
+
+```java
+public void onFailure(String agentId) {
+    if (agentId == null) {
+        return;
+    }
+    Health h = health.computeIfAbsent(agentId, ignored -> new Health());
+    long now = System.currentTimeMillis();
+    synchronized (h) {
+        boolean probing = h.probeInFlight;
+        h.probeInFlight = false;
+
+        if (probing) {
+            // 探针失败：直接重新打开，不攒阈值
+            h.failures = 0;
+            h.openUntil = now + Math.max(1L, properties.getCircuitOpenMs());
+            return;
+        }
+
+        // 正常失败：连续计数
+        h.failures++;
+        if (h.failures >= Math.max(1, properties.getCircuitFailureThreshold())) {
+            h.failures = 0;
+            h.openUntil = now + Math.max(1L, properties.getCircuitOpenMs());
+        }
+    }
+}
+```
+
+#### 一次 "没有真正抵达 peer" 的收尾
+
+消息没有真正发出去，不是接收方的问题，是投递侧问题，典型场景：
+
+投递闸显示已投过同一个 messageId；轮次已经推进，这条 turn 过期了
+
+把 probeInFlight 设为 false(tryAcquire 占了探针位，必须还回去，不然探针位永久卡住)
+
+```java
+public void onSettled(String agentId) {
+    if (agentId == null) {
+        return;
+    }
+    Health h = health.get(agentId);
+    if (h == null) {
+        return;
+    }
+    synchronized (h) {
+        h.probeInFlight = false;
     }
 }
 ```
